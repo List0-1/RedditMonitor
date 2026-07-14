@@ -194,27 +194,45 @@ def calculate_prospect_batch(
     product_ids: list[str] | None = None,
     public_id: str | None = None,
     zip_code: str | None = None,
-) -> tuple[dict[str, Any], str | None]:
+    *,
+    zip_attempts: int = 3,
+) -> tuple[dict[str, Any], str]:
     """HAR boxprice batch. Returns (payload, zip_used).
 
-    Picks a fresh residential proxy, resolves exit IP → ip-api ZIP, then
-    prices with that zipCode.
+    Requires a ZIP from the exit IP (ip-api). If ZIP is unavailable, blacklist
+    the current proxy, swap, and retry until zip_attempts is exhausted.
     """
     from geo import zipcode_for_exit_ip
-    from proxies import get_active_ip
+    from proxies import get_active_ip, swap_proxy_on_failure
 
-    proxies = _fresh_proxies(session)
-    exit_ip = get_active_ip()
-    resolved_zip = zip_code or zipcode_for_exit_ip(exit_ip)
+    forced_zip = str(zip_code).strip() if zip_code else ""
+    resolved_zip = forced_zip
+    proxies = None
+    exit_ip: str | None = None
+
+    for attempt in range(1, max(1, zip_attempts) + 1):
+        proxies = _fresh_proxies(session)
+        exit_ip = get_active_ip()
+        resolved_zip = forced_zip or (zipcode_for_exit_ip(exit_ip) or "")
+        if resolved_zip:
+            break
+        reason = f"zip_code unavailable (exit IP {exit_ip or '?'})"
+        print(f"    {reason} — swapping proxy ({attempt}/{zip_attempts})", flush=True)
+        swap_proxy_on_failure(reason=reason)
+
+    if not resolved_zip:
+        raise RuntimeError(
+            f"zip_code unavailable after {zip_attempts} proxies "
+            f"(last exit IP {exit_ip or '?'})"
+        )
 
     params: dict[str, str] = {
         "hfCountryCode": country,
         "hfPublicID": public_id or str(uuid.uuid4()),
         "productIds": ",".join(product_ids or DEFAULT_PRODUCT_IDS),
         "voucherCode": code,
+        "zipCode": str(resolved_zip).strip(),
     }
-    if resolved_zip:
-        params["zipCode"] = str(resolved_zip).strip()
 
     resp = session.get(
         "https://www.hellofresh.com/gw/calculate/prospect/batch",
@@ -235,7 +253,7 @@ def calculate_prospect_batch(
         timeout=15,
     )
     resp.raise_for_status()
-    return resp.json(), resolved_zip
+    return resp.json(), str(resolved_zip).strip()
 
 
 def summarize_box_prices(batch: dict[str, Any]) -> dict[str, Any]:
@@ -481,6 +499,10 @@ def pricing_metrics_from_result(result: dict[str, Any]) -> dict[str, Any] | None
 
 
 def has_required_api_pricing(result: dict[str, Any]) -> bool:
+    """True when ZIP + the 3 pricing metrics are all present from the API path."""
+    zip_code = str(result.get("zip_code") or "").strip()
+    if not zip_code:
+        return False
     return pricing_metrics_from_result(result) is not None
 
 
@@ -535,12 +557,18 @@ def resolve_share_link_with_retries(
                 promo["incomplete"] = True
                 return promo
 
-            # Success: promo code + the 3 required API pricing fields
+            # Success: promo code + zip + the 3 required API pricing fields
             if code and complete:
                 promo["incomplete"] = False
                 return promo
 
-            missing = "missing max_free_meals/servings_at_max/shipping_at_max from API"
+            missing = (
+                "missing zip_code or max_free_meals/servings_at_max/shipping_at_max"
+            )
+            if not str(promo.get("zip_code") or "").strip():
+                missing = (
+                    f"zip_code unavailable (exit IP {promo.get('exit_ip') or '?'})"
+                )
             reason = err or missing
             promo["incomplete"] = True
             promo["error"] = reason if not err else f"{err}; {missing}"
