@@ -10,7 +10,7 @@ Menu:
 from __future__ import annotations
 
 from proxies import load_proxies_at_start, proxy_label
-from scan import THREAD_URL, parse_all_links_from_reddit
+from scan import parse_all_links_from_reddit
 from monitor import run_monitor_loop
 
 
@@ -27,7 +27,7 @@ def main() -> int:
 
     while True:
         print("\nOptions:")
-        print("  1) Parse all Reddit comments and find links")
+        print("  1) Discover share-codes thread(s), collect links/codes, scan (10 workers)")
         print("  2) Monitor")
         print("  q) Quit")
         choice = input("Select: ").strip().lower()
@@ -43,7 +43,7 @@ def main() -> int:
             continue
         if choice == "2":
             try:
-                run_monitor_loop(THREAD_URL)
+                run_monitor_loop()
             except Exception as exc:  # noqa: BLE001
                 print(f"Error: {exc}")
             continue

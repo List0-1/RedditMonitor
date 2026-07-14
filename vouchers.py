@@ -34,12 +34,44 @@ def get_client() -> MongoClient:
 
 
 def canonical_share_link(url: str) -> str:
-    """Normalize to https://www.hellofresh.com/gw/share/CODE (no query)."""
-    parsed = urlparse((url or "").strip())
+    """Normalize share / landing URLs for dedupe.
+
+    - /gw/share/CODE  -> https://www.hellofresh.com/gw/share/CODE
+    - ?c=PROMO        -> https://www.hellofresh.com/pages/meal-kit-delivery?c=PROMO
+    """
+    from urllib.parse import parse_qs
+
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
     path = parsed.path.rstrip("/")
+    qs = parse_qs(parsed.query)
+
+    if "/gw/share/" in path.lower():
+        code = path.rsplit("/", 1)[-1] if path else ""
+        if not code:
+            return raw
+        return urlunparse(
+            ("https", "www.hellofresh.com", f"/gw/share/{code}", "", "", "")
+        )
+
+    promo = (qs.get("c") or [None])[0]
+    if promo:
+        return urlunparse(
+            (
+                "https",
+                "www.hellofresh.com",
+                "/pages/meal-kit-delivery",
+                "",
+                f"c={promo}",
+                "",
+            )
+        )
+
     code = path.rsplit("/", 1)[-1] if path else ""
     if not code:
-        return (url or "").strip()
+        return raw
     return urlunparse(("https", "www.hellofresh.com", f"/gw/share/{code}", "", "", ""))
 
 
@@ -58,15 +90,57 @@ def vouchers_collection() -> Collection:
     return col
 
 
+def _num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def is_bad_voucher(doc: dict[str, Any] | None) -> bool:
+    """True for inactive or no usable free-box offer.
+
+    Bad when:
+      - active is False, OR
+      - max_free_meals is missing/0, OR
+      - servings_at_max is missing/0
+
+    Bad docs stay in VoucherCodes and are skipped on each scan run.
+    """
+    if not doc:
+        return True
+    if doc.get("active") is False:
+        return True
+    meals = _num(doc.get("max_free_meals"), 0.0)
+    servings = _num(doc.get("servings_at_max"), 0.0)
+    return meals <= 0 or servings <= 0
+
+
 def load_known() -> dict[str, set[str]]:
-    """Preload known share links, promo codes, and reddit comment ids."""
-    col = vouchers_collection()
+    """Preload known share links / promo codes from VoucherCodes.
+
+    Bad vouchers (inactive / zero shipping) stay in Mongo and are listed in
+    bad_codes / bad_links so each scan run can skip them without deleting.
+    """
     share_links: set[str] = set()
     promo_codes: set[str] = set()
     comment_ids: set[str] = set()
-    for doc in col.find(
+    bad_codes: set[str] = set()
+    bad_links: set[str] = set()
+
+    for doc in vouchers_collection().find(
         {},
-        {"share_link": 1, "share_link_key": 1, "promo_code": 1, "reddit_comment_id": 1},
+        {
+            "share_link": 1,
+            "share_link_key": 1,
+            "promo_code": 1,
+            "reddit_comment_id": 1,
+            "active": 1,
+            "max_free_meals": 1,
+            "servings_at_max": 1,
+        },
     ):
         link = doc.get("share_link")
         key = doc.get("share_link_key") or (share_link_key(link) if link else "")
@@ -74,16 +148,24 @@ def load_known() -> dict[str, set[str]]:
             share_links.add(key)
         if link:
             share_links.add(share_link_key(link))
-        code = doc.get("promo_code")
+        code = str(doc.get("promo_code") or "").strip()
         if code:
-            promo_codes.add(str(code).strip())
+            promo_codes.add(code)
         cid = doc.get("reddit_comment_id")
         if cid:
             comment_ids.add(str(cid))
+        if is_bad_voucher(doc):
+            if code:
+                bad_codes.add(code)
+            if key:
+                bad_links.add(key)
+
     return {
         "share_links": share_links,
         "promo_codes": promo_codes,
         "comment_ids": comment_ids,
+        "bad_codes": bad_codes,
+        "bad_links": bad_links,
     }
 
 
@@ -114,21 +196,24 @@ def promo_result_to_doc(
     *,
     comment: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Build a VoucherCodes document from resolve_share_link() output."""
+    """Build a VoucherCodes document from resolve_share_link() output.
+
+    Requires API pricing metrics (max_free_meals, servings_at_max, shipping_at_max).
+    Returns None when those are missing — caller must not save incomplete data.
+    """
+    from promo import format_offer_line, pricing_metrics_from_result
+
     code = result.get("promo_code")
     share = result.get("share_url")
     if not code or not share:
         return None
 
+    metrics = pricing_metrics_from_result(result)
+    if not metrics:
+        return None
+
     voucher = result.get("voucher") or {}
     pricing = result.get("box_pricing") or {}
-    best = pricing.get("best_free") or {}
-
-    from promo import format_offer_line  # local import avoids cycles at module load
-
-    ship = float(best.get("shipping") or 0)
-    ship_disc = float(best.get("shipping_discount") or 0)
-    ship_due = round(ship - ship_disc, 2)
 
     now = datetime.now(timezone.utc)
     doc: dict[str, Any] = {
@@ -141,11 +226,11 @@ def promo_result_to_doc(
         "discount_value": voucher.get("discount_value"),
         "channel": voucher.get("channel"),
         "boxes": voucher.get("box_discounts") or {},
-        "max_free_meals": pricing.get("max_free_meals"),
-        "servings_at_max": best.get("people"),
-        "shipping_at_max": ship_due,
-        "shipping_fee": round(ship, 2),
-        "shipping_discount": round(ship_disc, 2),
+        "max_free_meals": metrics["max_free_meals"],
+        "servings_at_max": metrics["servings_at_max"],
+        "shipping_at_max": metrics["shipping_at_max"],
+        "shipping_fee": metrics["shipping_fee"],
+        "shipping_discount": metrics["shipping_discount"],
         "free_configs": [
             {
                 "meals": r.get("meals"),
@@ -244,15 +329,6 @@ def comparable_snapshot(doc: dict[str, Any]) -> dict[str, Any]:
 
 def best_voucher_collection() -> Collection:
     return get_client()[VOUCHERS_DB][BEST_COL]
-
-
-def _num(value: Any, default: float) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def voucher_rank_key(doc: dict[str, Any]) -> tuple[float, float, float]:

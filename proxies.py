@@ -42,6 +42,7 @@ _proxies_lock = threading.Lock()
 _active_proxy: dict[str, str] | None = None
 _active_ip: str | None = None
 _cycle_ips: set[str] = set()
+_broken_proxies: set[str] = set()  # identities that failed this process
 _test_headers = {
     "user-agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14) "
@@ -127,6 +128,30 @@ def begin_proxy_cycle(label: str = "monitor") -> None:
     global _cycle_ips
     with _proxies_lock:
         _cycle_ips = set()
+    print(f"[PROXIES] cycle start: {label} (broken={len(_broken_proxies)})", flush=True)
+
+
+def mark_proxy_broken(proxy: dict[str, str] | None = None, *, reason: str = "") -> None:
+    """Blacklist current (or given) proxy for the rest of this process — swap away."""
+    global _active_proxy, _active_ip
+    target = proxy or _active_proxy
+    ident = proxy_identity(target)
+    if not ident:
+        return
+    with _proxies_lock:
+        _broken_proxies.add(ident)
+    label = proxy_label(target)
+    why = f" ({reason})" if reason else ""
+    print(f"[PROXIES] ❌ broken → blacklist {label}{why}", flush=True)
+    if proxy_identity(_active_proxy) == ident:
+        _active_proxy = None
+        _active_ip = None
+
+
+def swap_proxy_on_failure(*, reason: str = "request failed") -> dict[str, str] | None:
+    """Mark current proxy broken and immediately pick a fresh pretest-ed one."""
+    mark_proxy_broken(reason=reason)
+    return next_proxy(prefer_different=True)
 
 
 def cycle_ips_used() -> set[str]:
@@ -240,16 +265,19 @@ def get_active_ip() -> str | None:
 
 
 def next_proxy(*, prefer_different: bool = True) -> dict[str, str] | None:
-    """Pick + pretest a proxy with an exit IP not yet used in this cycle."""
+    """Pick + pretest a proxy with an exit IP not yet used in this cycle.
+
+    Skips proxies already marked broken this process.
+    """
     global _active_proxy, _active_ip
     with _proxies_lock:
         rows = list(_proxies_raw)
         used = set(_cycle_ips)
+        broken = set(_broken_proxies)
 
     if not rows:
         return _active_proxy
 
-    # Prefer not reusing the exact same credential session either
     current_id = proxy_identity(_active_proxy) if prefer_different else None
     order = rows[:]
     random.shuffle(order)
@@ -259,11 +287,17 @@ def next_proxy(*, prefer_different: bool = True) -> dict[str, str] | None:
         if tries >= PROXY_PICK_TRIES:
             break
         proxy = to_proxy_dict(host, port, user, passw)
-        if current_id and proxy_identity(proxy) == current_id:
+        ident = proxy_identity(proxy)
+        if ident in broken:
+            continue
+        if current_id and ident == current_id:
             continue
         tries += 1
         ip = test_proxy_exit_ip(proxy, timeout=IP_TEST_TIMEOUT)
         if not ip:
+            # Pretest failed — don't keep offering this credential
+            with _proxies_lock:
+                _broken_proxies.add(ident)
             continue
         if ip in used:
             continue
@@ -274,14 +308,23 @@ def next_proxy(*, prefer_different: bool = True) -> dict[str, str] | None:
             _cycle_ips.add(ip)
         return _active_proxy
 
-    # Fallback: allow reuse of an IP if pool exhausted (still pretest)
-    proxy, ip = pick_working_proxy(rows, max_tries=PROXY_PICK_TRIES, quiet=True)
+    # Fallback: allow IP reuse but still skip broken
+    candidates = [
+        row
+        for row in rows
+        if proxy_identity(to_proxy_dict(*row)) not in broken
+    ]
+    proxy, ip = pick_working_proxy(
+        candidates or rows, max_tries=PROXY_PICK_TRIES, quiet=True
+    )
     if proxy and ip:
-        _active_proxy = proxy
-        _active_ip = ip
-        with _proxies_lock:
-            _cycle_ips.add(ip)
-        return _active_proxy
+        ident = proxy_identity(proxy)
+        if ident not in broken:
+            _active_proxy = proxy
+            _active_ip = ip
+            with _proxies_lock:
+                _cycle_ips.add(ip)
+            return _active_proxy
 
     print("[PROXIES] ❌ no working proxy available", flush=True)
     return None

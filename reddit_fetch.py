@@ -233,6 +233,175 @@ def fetch_thread_listing(
     )
 
 
+def fetch_reddit_json(
+    url: str,
+    *,
+    referer: str | None = None,
+    impersonate: str = "chrome131",
+    max_attempts: int = 3,
+) -> Any:
+    """GET a Reddit JSON endpoint with challenge solve + proxy retries."""
+    import time
+
+    from proxies import next_proxy
+
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        proxy = next_proxy()
+        print(f"[REDDIT] attempt {attempt}/{max_attempts}", flush=True)
+        sess = create_session(impersonate=impersonate, proxies=proxy)
+        try:
+            # Seed cookies via HTML of same path when possible
+            html_seed = url
+            if html_seed.endswith(".json"):
+                html_seed = html_seed[: -len(".json")]
+            if "?" in html_seed:
+                html_seed = html_seed.split("?", 1)[0]
+            if not html_seed.endswith("/"):
+                html_seed += "/"
+            establish_reddit_session(sess, html_seed)
+
+            resp = sess.get(
+                url,
+                proxies=_proxies_of(sess),
+                headers={
+                    "Accept": "application/json,text/html,*/*",
+                    "Referer": referer or html_seed,
+                },
+                allow_redirects=True,
+                timeout=15,
+            )
+            if is_verification_page(resp.text):
+                resp = solve_verification(sess, resp)
+                resp = sess.get(
+                    url,
+                    proxies=_proxies_of(sess),
+                    headers={
+                        "Accept": "application/json,text/html,*/*",
+                        "Referer": referer or html_seed,
+                    },
+                    allow_redirects=True,
+                    timeout=15,
+                )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Reddit JSON HTTP {resp.status_code}")
+            text = resp.text.lstrip()
+            if not (text.startswith("{") or text.startswith("[")):
+                raise RuntimeError("Reddit did not return JSON")
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            print(
+                f"[REDDIT] proxy/request failed ({attempt}/{max_attempts}): {exc}",
+                flush=True,
+            )
+            if attempt < max_attempts:
+                time.sleep(0.8)
+                continue
+        finally:
+            sess.close()
+    raise RuntimeError(f"Reddit JSON fetch failed after {max_attempts} retries: {last_error}")
+
+
+SHARE_THREAD_TITLE_RE = re.compile(
+    r"share\s+weekly\s+trial",
+    re.IGNORECASE,
+)
+
+
+def _post_to_thread_info(data: dict[str, Any]) -> dict[str, Any] | None:
+    title = str(data.get("title") or "")
+    if not SHARE_THREAD_TITLE_RE.search(title):
+        return None
+    permalink = data.get("permalink") or ""
+    if permalink.startswith("/"):
+        url = f"https://www.reddit.com{permalink}"
+    else:
+        url = str(data.get("url") or "")
+    if not url:
+        return None
+    return {
+        "url": url.rstrip("/") + "/",
+        "title": title,
+        "id": data.get("id"),
+        "created_utc": data.get("created_utc") or 0,
+        "num_comments": data.get("num_comments") or 0,
+        "author": data.get("author"),
+        "stickied": bool(data.get("stickied") or data.get("pinned")),
+    }
+
+
+def find_share_code_threads(
+    subreddit: str = "hellofresh",
+) -> list[dict[str, Any]]:
+    """Find HelloFresh share-codes threads (stickied/pinned first, else search).
+
+    Returns newest-first list of {url, title, id, ...}.
+    """
+    listing = fetch_reddit_json(
+        f"https://www.reddit.com/r/{subreddit}/hot.json?limit=50&raw_json=1",
+        referer=f"https://www.reddit.com/r/{subreddit}/",
+    )
+    children = ((listing.get("data") or {}).get("children")) or []
+    matches: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for node in children:
+        if node.get("kind") != "t3":
+            continue
+        data = node.get("data") or {}
+        if not (data.get("stickied") or data.get("pinned")):
+            continue
+        info = _post_to_thread_info(data)
+        if not info:
+            continue
+        pid = str(info.get("id") or "")
+        if pid and pid in seen_ids:
+            continue
+        if pid:
+            seen_ids.add(pid)
+        matches.append(info)
+
+    if not matches:
+        # Fallback: search recent weekly threads by title
+        search = fetch_reddit_json(
+            f"https://www.reddit.com/r/{subreddit}/search.json"
+            f"?q=title%3AShare+Weekly+Trial&restrict_sr=1&sort=new&limit=5&raw_json=1",
+            referer=f"https://www.reddit.com/r/{subreddit}/",
+        )
+        for node in ((search.get("data") or {}).get("children")) or []:
+            if node.get("kind") != "t3":
+                continue
+            info = _post_to_thread_info(node.get("data") or {})
+            if not info:
+                continue
+            pid = str(info.get("id") or "")
+            if pid and pid in seen_ids:
+                continue
+            if pid:
+                seen_ids.add(pid)
+            matches.append(info)
+
+    if not matches:
+        raise RuntimeError(
+            f"No HelloFresh share-codes thread found on r/{subreddit}"
+        )
+
+    matches.sort(key=lambda m: float(m.get("created_utc") or 0), reverse=True)
+    print(f"[REDDIT] Found {len(matches)} share-codes thread(s):", flush=True)
+    for m in matches:
+        print(
+            f"  • {m['title'][:60]} | comments={m['num_comments']} | {m['url']}",
+            flush=True,
+        )
+    return matches
+
+
+def find_pinned_share_thread(subreddit: str = "hellofresh") -> dict[str, Any]:
+    """Newest share-codes thread (compat wrapper)."""
+    return find_share_code_threads(subreddit=subreddit)[0]
+
+
 def fetch_comments(
     thread_url: str,
     *,

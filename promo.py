@@ -291,6 +291,33 @@ def summarize_box_prices(batch: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_proxy_error(err: str | Exception | None) -> bool:
+    text = str(err or "").lower()
+    markers = (
+        "timed out",
+        "timeout",
+        "connect tunnel failed",
+        "curl: (28)",
+        "curl: (56)",
+        "curl: (7)",
+        "curl: (35)",
+        "proxy",
+        "503",
+        "502",
+        "connection reset",
+        "connection refused",
+        "ssl",
+        "failed to perform",
+    )
+    return any(m in text for m in markers)
+
+
+def _is_permanent_voucher_miss(err: str | Exception | None) -> bool:
+    """HTTP 404 on /gw/vouchers — code itself is invalid, not a proxy issue."""
+    text = str(err or "").lower()
+    return "http error 404" in text or "http 404" in text or ": 404" in text
+
+
 def resolve_share_link(
     share_url: str,
     session: crequests.Session | None = None,
@@ -315,6 +342,7 @@ def resolve_share_link(
         "exit_ip": None,
         "error": None,
         "transient": False,
+        "permanent": False,
     }
     notes: list[str] = []
 
@@ -328,7 +356,8 @@ def resolve_share_link(
         )
         if page.status_code >= 400:
             result["error"] = f"Share link HTTP {page.status_code}"
-            result["transient"] = True
+            result["transient"] = page.status_code in {429, 500, 502, 503, 504}
+            result["permanent"] = page.status_code == 404
             return result
 
         result["final_url"] = page.url
@@ -378,9 +407,12 @@ def resolve_share_link(
                 result["voucher"] = summarize_voucher(voucher)
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"voucher details unavailable: {exc}")
-                result["transient"] = True
+                if _is_permanent_voucher_miss(exc):
+                    result["permanent"] = True
+                else:
+                    result["transient"] = True
 
-        if check_box_prices:
+        if check_box_prices and not result.get("permanent"):
             try:
                 batch, zip_used = calculate_prospect_batch(
                     session,
@@ -413,6 +445,45 @@ def resolve_share_link(
     return result
 
 
+def pricing_metrics_from_result(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Require max_free_meals, servings_at_max, shipping_at_max from box-pricing API.
+
+    shipping_at_max may be 0.0 (free shipping) — that still counts as a real value.
+    Returns None when any of the three is missing from the API payload.
+    """
+    pricing = result.get("box_pricing")
+    if not isinstance(pricing, dict):
+        return None
+    meals = pricing.get("max_free_meals")
+    best = pricing.get("best_free")
+    if meals is None or not isinstance(best, dict):
+        return None
+    servings = best.get("people")
+    if servings is None:
+        return None
+    # shipping / shipping_discount must be present on the best_free row
+    if "shipping" not in best and "shipping_discount" not in best:
+        return None
+    try:
+        ship = float(best.get("shipping") or 0)
+        ship_disc = float(best.get("shipping_discount") or 0)
+        meals_i = int(meals)
+        servings_i = int(servings)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "max_free_meals": meals_i,
+        "servings_at_max": servings_i,
+        "shipping_at_max": round(ship - ship_disc, 2),
+        "shipping_fee": round(ship, 2),
+        "shipping_discount": round(ship_disc, 2),
+    }
+
+
+def has_required_api_pricing(result: dict[str, Any]) -> bool:
+    return pricing_metrics_from_result(result) is not None
+
+
 def resolve_share_link_with_retries(
     share_url: str,
     *,
@@ -421,8 +492,10 @@ def resolve_share_link_with_retries(
     locale: str = "en-US",
     max_attempts: int = 3,
 ) -> dict[str, Any]:
-    """Resolve a share link; retry up to max_attempts on any proxy/transient failure."""
+    """Resolve share link; require pricing metrics; swap proxy and retry up to 3x."""
     import time
+
+    from proxies import swap_proxy_on_failure
 
     own = session is None
     session = session or create_hf_session()
@@ -442,36 +515,49 @@ def resolve_share_link_with_retries(
                     "promo_code": None,
                     "error": str(exc),
                     "transient": True,
+                    "permanent": False,
                 }
 
             last = promo
             code = promo.get("promo_code")
             active = (promo.get("voucher") or {}).get("is_active")
-            has_voucher = promo.get("voucher") is not None
-            has_pricing = promo.get("box_pricing") is not None
+            err = promo.get("error") or ""
+            complete = has_required_api_pricing(promo)
 
-            # Confirmed inactive — stop
-            if code and active is False:
+            # Confirmed inactive with enough data — stop
+            if code and active is False and complete:
                 return promo
 
-            # Full success: code + voucher + box pricing, no transient flag
-            if code and has_voucher and has_pricing and not promo.get("transient"):
+            # Permanent miss (404 etc.) — stop immediately (caller will not save)
+            if promo.get("permanent") or _is_permanent_voucher_miss(err):
+                if attempt > 1 or err:
+                    print(f"    permanent fail (no retry): {err or '404'}", flush=True)
+                promo["incomplete"] = True
                 return promo
 
-            # Soft success: code + voucher details (pricing optional soft-fail last attempt)
-            if code and has_voucher and not promo.get("transient"):
+            # Success: promo code + the 3 required API pricing fields
+            if code and complete:
+                promo["incomplete"] = False
                 return promo
 
-            # Last attempt: accept whatever we got if we at least have a code
-            if attempt >= max_attempts and code:
+            missing = "missing max_free_meals/servings_at_max/shipping_at_max from API"
+            reason = err or missing
+            promo["incomplete"] = True
+            promo["error"] = reason if not err else f"{err}; {missing}"
+
+            if attempt >= max_attempts:
+                print(
+                    f"    give up after {max_attempts} tries — incomplete pricing, will not save",
+                    flush=True,
+                )
                 return promo
 
-            err = promo.get("error") or "incomplete/proxy failure"
+            swap_proxy_on_failure(reason=reason[:120])
             print(
-                f"    retry {attempt}/{max_attempts} (proxy/transient): {err}",
+                f"    retry {attempt}/{max_attempts} after proxy swap: {reason}",
                 flush=True,
             )
-            time.sleep(0.6)
+            time.sleep(0.4)
         return last
     finally:
         if own:

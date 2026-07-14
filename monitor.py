@@ -42,6 +42,11 @@ SHARE_RE = re.compile(
     r"(?:\?[^\s<>\]\)\"'*]*)?",
     re.IGNORECASE,
 )
+# Bare promo codes posted without a share URL (e.g. FIH-XXXX, 8E-0HF4IFN8F82)
+PROMO_CODE_RE = re.compile(
+    r"\b([A-Z0-9]{1,4}-[A-Z0-9]{8,})\b",
+    re.IGNORECASE,
+)
 
 
 def normalize_share_url(url: str) -> str | None:
@@ -78,6 +83,23 @@ def extract_share_links(text: str) -> list[str]:
     return found
 
 
+def extract_promo_codes(text: str) -> list[str]:
+    """Bare promo codes in comment text (excluding ones inside share URLs)."""
+    if not text:
+        return []
+    cleaned = text.replace("\\_", "_").replace("&amp;", "&")
+    # Strip share URLs so we don't double-count path fragments
+    cleaned = SHARE_RE.sub(" ", cleaned)
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in PROMO_CODE_RE.finditer(cleaned):
+        code = match.group(1).strip().upper()
+        if code and code not in seen:
+            seen.add(code)
+            found.append(code)
+    return found
+
+
 def walk_comments(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for node in children or []:
@@ -88,6 +110,9 @@ def walk_comments(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
         links = extract_share_links(body)
         if not links:
             links = extract_share_links(data.get("body_html") or "")
+        codes = extract_promo_codes(body)
+        if not codes:
+            codes = extract_promo_codes(data.get("body_html") or "")
 
         results.append(
             {
@@ -97,6 +122,7 @@ def walk_comments(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "permalink": data.get("permalink"),
                 "body": body,
                 "share_links": links,
+                "promo_codes": codes,
             }
         )
 
@@ -206,11 +232,11 @@ def refresh_voucher_statuses(
     country: str = "US",
     locale: str = "en-US",
 ) -> dict[str, int]:
-    """Re-check every stored voucher; update changes; delete only if inactive."""
+    """Re-check every stored voucher; update changes; keep bad codes for skip."""
     from proxies import begin_proxy_cycle, cycle_ips_used
     from vouchers import (
         comparable_snapshot,
-        delete_voucher,
+        is_bad_voucher,
         list_vouchers,
         promo_result_to_doc,
         update_voucher,
@@ -249,9 +275,14 @@ def refresh_voucher_statuses(
             print(f"  [{i}/{len(docs)}] {code}", flush=True)
             stats["checked"] += 1
             if not share:
-                print("    → delete (missing share_link)", flush=True)
-                delete_voucher(code)
-                stats["deleted"] += 1
+                print("    → keep (missing share_link — skip resolve)", flush=True)
+                stats["ok"] += 1
+                continue
+
+            # Already known-bad: leave in Mongo for scan skip (don't re-burn proxies)
+            if is_bad_voucher(doc):
+                print("    → skip resolve (bad in Mongo — kept for scan skip)", flush=True)
+                stats["ok"] += 1
                 continue
 
             promo = resolve_share_link_with_retries(
@@ -263,15 +294,45 @@ def refresh_voucher_statuses(
             )
             print(format_promo_result(promo), flush=True)
 
+            from promo import has_required_api_pricing
+
             voucher = promo.get("voucher") or {}
             active = voucher.get("is_active")
             resolved_code = promo.get("promo_code")
 
-            # Only delete when HelloFresh confirms inactive
+            # Incomplete pricing after retries — keep existing Mongo row untouched
+            if not has_required_api_pricing(promo):
+                print(
+                    f"    → keep (incomplete pricing after retries: {promo.get('error')})",
+                    flush=True,
+                )
+                stats["errors"] += 1
+                time.sleep(0.5)
+                continue
+
+            # Keep inactive/bad in Mongo so future scans skip them
             if active is False:
-                print("    → delete (inactive)", flush=True)
-                delete_voucher(code)
-                stats["deleted"] += 1
+                update_voucher(
+                    code,
+                    {
+                        "active": False,
+                        "max_free_meals": 0,
+                        "servings_at_max": 0,
+                    },
+                )
+                print("    → marked inactive (kept for scan skip)", flush=True)
+                stats["updated"] += 1
+                time.sleep(0.5)
+                continue
+
+            fresh = promo_result_to_doc(promo, comment=None)
+            if fresh and is_bad_voucher(fresh):
+                update_fields = {k: fresh[k] for k in comparable_snapshot(fresh) if k in fresh}
+                update_fields.pop("share_link", None)
+                update_fields.pop("share_link_key", None)
+                update_voucher(code, update_fields)
+                print("    → marked bad (no free meals/servings; kept for scan skip)", flush=True)
+                stats["updated"] += 1
                 time.sleep(0.5)
                 continue
 
@@ -285,7 +346,6 @@ def refresh_voucher_statuses(
                 time.sleep(0.5)
                 continue
 
-            fresh = promo_result_to_doc(promo, comment=None)
             if not fresh:
                 stats["errors"] += 1
                 time.sleep(0.5)
@@ -336,18 +396,19 @@ def refresh_voucher_statuses(
 
 
 def run_monitor_loop(
-    thread_url: str = THREAD_URL,
+    thread_url: str | None = None,
     *,
     reddit_interval: int = 3 * 60 * 60,
     status_interval: int = 5 * 60,
     country: str = "US",
     locale: str = "en-US",
 ) -> None:
-    """Monitor: Reddit every 3h for new links; status refresh every 5m."""
+    """Monitor: discover share-codes thread(s), scan every 3h; status every 5m."""
     from scan import parse_all_links_from_reddit
 
+    target = thread_url or "auto-discover pinned HelloFresh share-codes thread(s)"
     print(
-        f"Monitoring {thread_url}\n"
+        f"Monitoring {target}\n"
         f"Reddit scan every {reddit_interval}s | "
         f"status check every {status_interval}s\n"
         f"Proxy: {proxy_label(get_active_proxy())}",
@@ -389,7 +450,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Monitor Reddit HelloFresh share links and resolve promo codes"
     )
-    parser.add_argument("--url", default=THREAD_URL)
+    parser.add_argument(
+        "--url",
+        default=None,
+        help="Optional Reddit thread URL (default: auto-discover pinned share-codes thread)",
+    )
     parser.add_argument(
         "--reddit-interval",
         type=int,
