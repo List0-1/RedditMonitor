@@ -1,5 +1,5 @@
 # RedditMonitor — always-on worker (512 MB)
-app = "reddit-monitor"
+app = "reddit-monitor-cfz"
 primary_region = "iad"
 
 [build]
