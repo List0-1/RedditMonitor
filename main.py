@@ -4,7 +4,7 @@
 At start: load proxies from MongoDB (Proxies DB, same as UEControl.py).
 Menu:
   1) Parse all Reddit comments and find links (skip known; save new to Mongo)
-  2) Monitor (Reddit every 3h; promo status every 5m)
+  2) Monitor (Reddit every 30m; promo status every 5m)
 """
 
 from __future__ import annotations

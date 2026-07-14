@@ -398,12 +398,12 @@ def refresh_voucher_statuses(
 def run_monitor_loop(
     thread_url: str | None = None,
     *,
-    reddit_interval: int = 3 * 60 * 60,
+    reddit_interval: int = 30 * 60,
     status_interval: int = 5 * 60,
     country: str = "US",
     locale: str = "en-US",
 ) -> None:
-    """Monitor: discover share-codes thread(s), scan every 3h; status every 5m."""
+    """Monitor: discover share-codes thread(s), scan every 30m; status every 5m."""
     from scan import parse_all_links_from_reddit
 
     target = thread_url or "auto-discover pinned HelloFresh share-codes thread(s)"
@@ -458,8 +458,8 @@ def main() -> int:
     parser.add_argument(
         "--reddit-interval",
         type=int,
-        default=3 * 60 * 60,
-        help="Seconds between Reddit scans (default 3h)",
+        default=30 * 60,
+        help="Seconds between Reddit scans (default 30m)",
     )
     parser.add_argument(
         "--status-interval",

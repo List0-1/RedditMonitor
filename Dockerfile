@@ -13,5 +13,5 @@ COPY main.py monitor.py promo.py proxies.py reddit_fetch.py scan.py vouchers.py 
 
 ENV PYTHONUNBUFFERED=1
 
-# Continuous monitor: Reddit every 3h, status every 5m
+# Continuous monitor: Reddit every 30m, status every 5m
 CMD ["python", "-u", "monitor.py"]
