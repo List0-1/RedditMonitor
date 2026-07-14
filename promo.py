@@ -361,6 +361,7 @@ def resolve_share_link(
         "error": None,
         "transient": False,
         "permanent": False,
+        "code_invalid": False,
     }
     notes: list[str] = []
 
@@ -426,11 +427,12 @@ def resolve_share_link(
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"voucher details unavailable: {exc}")
                 if _is_permanent_voucher_miss(exc):
-                    result["permanent"] = True
+                    # Confirmed invalid / not-working code (save as active:false)
+                    result["code_invalid"] = True
                 else:
                     result["transient"] = True
 
-        if check_box_prices and not result.get("permanent"):
+        if check_box_prices:
             try:
                 batch, zip_used = calculate_prospect_batch(
                     session,
@@ -442,9 +444,14 @@ def resolve_share_link(
                 result["zip_code"] = zip_used
                 result["exit_ip"] = get_active_ip()
                 result["box_pricing"] = summarize_box_prices(batch)
+                # ZIP resolved — clear transient from voucher-only soft fails
+                # if pricing metrics are present (checked by caller).
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"box pricing unavailable: {exc}")
                 result["transient"] = True
+                if "zip_code unavailable" in str(exc).lower():
+                    # Force outer retry / proxy swap
+                    result["error"] = "; ".join(notes + [str(exc)])
 
         if notes:
             result["error"] = "; ".join(notes)
@@ -498,6 +505,26 @@ def pricing_metrics_from_result(result: dict[str, Any]) -> dict[str, Any] | None
     }
 
 
+def is_confirmed_dead_code(result: dict[str, Any]) -> bool:
+    """True when HelloFresh confirms the code does not work.
+
+    Observed for dead codes:
+      - GET /gw/vouchers/{code} → HTTP 404, voucher=null
+      - box pricing may still return with max_free_meals=None / best_free=None
+      - OR voucher.is_active is False
+    """
+    if not result.get("promo_code"):
+        return False
+    voucher = result.get("voucher") or {}
+    if voucher.get("is_active") is False:
+        return True
+    if result.get("code_invalid"):
+        return True
+    if _is_permanent_voucher_miss(result.get("error")):
+        return True
+    return False
+
+
 def has_required_api_pricing(result: dict[str, Any]) -> bool:
     """True when ZIP + the 3 pricing metrics are all present from the API path."""
     zip_code = str(result.get("zip_code") or "").strip()
@@ -545,15 +572,33 @@ def resolve_share_link_with_retries(
             active = (promo.get("voucher") or {}).get("is_active")
             err = promo.get("error") or ""
             complete = has_required_api_pricing(promo)
+            dead = is_confirmed_dead_code(promo)
 
-            # Confirmed inactive with enough data — stop
-            if code and active is False and complete:
+            # Confirmed not-working (404 / inactive) — stop; caller saves active:false
+            if code and dead:
+                # Prefer having a ZIP on the doc; one more swap if pricing never ran
+                if not str(promo.get("zip_code") or "").strip() and attempt < max_attempts:
+                    swap_proxy_on_failure(reason="dead code missing zip_code")
+                    print(
+                        f"    dead code {code} — retry {attempt}/{max_attempts} for zip_code",
+                        flush=True,
+                    )
+                    time.sleep(0.4)
+                    continue
+                promo["incomplete"] = False
+                promo["dead"] = True
+                print(f"    confirmed dead code ({code}) — will save active:false", flush=True)
                 return promo
 
-            # Permanent miss (404 etc.) — stop immediately (caller will not save)
-            if promo.get("permanent") or _is_permanent_voucher_miss(err):
-                if attempt > 1 or err:
-                    print(f"    permanent fail (no retry): {err or '404'}", flush=True)
+            # Confirmed inactive with full pricing — stop
+            if code and active is False and complete:
+                promo["incomplete"] = False
+                promo["dead"] = True
+                return promo
+
+            # Share-link hard miss (no promo code, page 404) — stop
+            if promo.get("permanent") and not code:
+                print(f"    permanent fail (no retry): {err or '404'}", flush=True)
                 promo["incomplete"] = True
                 return promo
 

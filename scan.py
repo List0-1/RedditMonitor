@@ -16,12 +16,14 @@ from urllib.parse import quote
 from promo import (
     format_promo_result,
     has_required_api_pricing,
+    is_confirmed_dead_code,
     resolve_share_link_with_retries,
 )
 from reddit_fetch import fetch_comments, find_share_code_threads
 from vouchers import (
     canonical_share_link,
     exists,
+    inactive_voucher_doc,
     insert_voucher,
     is_bad_voucher,
     load_known,
@@ -172,6 +174,28 @@ def _resolve_one(
     if kind == "share" and share_link_exists(value):
         print("  → skip save (share_link already in Mongo)", flush=True)
         out["skipped_exists"] += 1
+        return out
+
+    # Confirmed not-working (voucher 404 / inactive) → save active:false for skip
+    if promo.get("dead") or is_confirmed_dead_code(promo):
+        doc = inactive_voucher_doc(promo, comment=comment)
+        if not doc:
+            print("  → skip save (dead code but missing promo/share)", flush=True)
+            out["failed"] += 1
+            return out
+        action = insert_voucher(doc)
+        if action == "inserted":
+            print("  → saved inactive code (active:false) for later skip", flush=True)
+            out["inserted"] += 1
+        else:
+            print(f"  → skip save ({action}) dead/existing", flush=True)
+            out["skipped_exists"] += 1
+        with known_lock:
+            known["promo_codes"].add(doc["promo_code"])
+            known.setdefault("bad_codes", set()).add(doc["promo_code"])
+            if doc.get("share_link_key"):
+                known["share_links"].add(doc["share_link_key"])
+                known.setdefault("bad_links", set()).add(doc["share_link_key"])
         return out
 
     # Incomplete API pricing after retries — do NOT save (unknown good/bad)

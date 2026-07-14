@@ -191,6 +191,59 @@ def share_link_exists(share_link: str) -> bool:
     return exists(share_link=share_link)
 
 
+def inactive_voucher_doc(
+    result: dict[str, Any],
+    *,
+    comment: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Build a VoucherCodes doc for a confirmed not-working code (active:false)."""
+    code = result.get("promo_code")
+    share = result.get("share_url")
+    if not code or not share:
+        return None
+
+    now = datetime.now(timezone.utc)
+    metrics = None
+    try:
+        from promo import pricing_metrics_from_result
+
+        metrics = pricing_metrics_from_result(result)
+    except Exception:  # noqa: BLE001
+        metrics = None
+
+    doc: dict[str, Any] = {
+        "promo_code": str(code).strip(),
+        "share_link": canonical_share_link(share),
+        "share_link_key": share_link_key(share),
+        "offer": None,
+        "active": False,
+        "discount_type": None,
+        "discount_value": None,
+        "channel": None,
+        "boxes": {},
+        "max_free_meals": (metrics or {}).get("max_free_meals", 0) or 0,
+        "servings_at_max": (metrics or {}).get("servings_at_max", 0) or 0,
+        "shipping_at_max": (metrics or {}).get("shipping_at_max", 0) or 0,
+        "shipping_fee": (metrics or {}).get("shipping_fee", 0) or 0,
+        "shipping_discount": (metrics or {}).get("shipping_discount", 0) or 0,
+        "free_configs": [],
+        "zip_code": result.get("zip_code"),
+        "dead_reason": str(result.get("error") or "code_invalid")[:300],
+        "updated_at": now,
+    }
+
+    if comment:
+        doc["reddit_comment_id"] = comment.get("id")
+        doc["reddit_author"] = comment.get("author")
+        permalink = comment.get("permalink") or ""
+        if permalink.startswith("/"):
+            permalink = f"https://www.reddit.com{permalink}"
+        doc["reddit_permalink"] = permalink or None
+        doc["reddit_created_utc"] = comment.get("created_utc")
+
+    return doc
+
+
 def promo_result_to_doc(
     result: dict[str, Any],
     *,
