@@ -1,0 +1,10 @@
+seen_links.json
+matches.json
+cookies.json
+cookies.txt
+__pycache__/
+.venv/
+venv/
+*.har
+.DS_Store
+.env

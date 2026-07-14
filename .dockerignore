@@ -1,0 +1,14 @@
+# Ignore Docker build context noise
+.git
+__pycache__
+.venv
+venv
+*.pyc
+.env
+cookies.json
+cookies.txt
+matches.json
+seen_links.json
+*.har
+README.md
+.DS_Store

@@ -1,0 +1,17 @@
+# RedditMonitor — always-on worker (512 MB)
+app = "reddit-monitor"
+primary_region = "iad"
+
+[build]
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[processes]
+  app = "python -u monitor.py"
+
+# Keep the monitor running 24/7 (no scale-to-zero)
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpus = 1
