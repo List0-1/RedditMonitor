@@ -385,9 +385,12 @@ def best_voucher_collection() -> Collection:
 
 
 def voucher_rank_key(doc: dict[str, Any]) -> tuple[float, float, float]:
-    """Sort key: lowest shipping, then highest meals, then highest servings.
+    """Sort key for BestVoucherCode.
 
-    Priority: shipping_at_max > max_free_meals > servings_at_max
+    Priority (best first):
+      1) lowest shipping_at_max  (0 is best)
+      2) highest max_free_meals
+      3) highest servings_at_max
     """
     shipping = _num(doc.get("shipping_at_max"), default=9999.0)
     meals = _num(doc.get("max_free_meals"), default=-1.0)
@@ -395,28 +398,41 @@ def voucher_rank_key(doc: dict[str, Any]) -> tuple[float, float, float]:
     return (shipping, -meals, -servings)
 
 
+def _eligible_for_best(doc: dict[str, Any]) -> bool:
+    """Active with real free-box metrics (meals > 0 and servings > 0)."""
+    if doc.get("active") is not True:
+        return False
+    meals = _num(doc.get("max_free_meals"), 0.0)
+    servings = _num(doc.get("servings_at_max"), 0.0)
+    return meals > 0 and servings > 0
+
+
 def select_best_active_voucher(
     docs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """Pick best active voucher: min shipping, then max meals, then max servings."""
+    """Pick best eligible voucher, or None → BestVoucherCode should be empty."""
     pool = docs if docs is not None else list_vouchers()
-    active = [d for d in pool if d.get("active") is True]
-    if not active:
+    eligible = [d for d in pool if _eligible_for_best(d)]
+    if not eligible:
         return None
-    return min(active, key=voucher_rank_key)
+    return min(eligible, key=voucher_rank_key)
 
 
 def update_best_voucher_code(
     docs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """Select best active voucher and upsert HelloFresh.BestVoucherCode."""
+    """Select best voucher and upsert HelloFresh.BestVoucherCode (or clear it)."""
     best = select_best_active_voucher(docs)
     col = best_voucher_collection()
     now = datetime.now(timezone.utc)
 
     if best is None:
         col.delete_one({"_id": BEST_DOC_ID})
-        print("BestVoucherCode: none (no active vouchers)", flush=True)
+        print(
+            "BestVoucherCode: empty (no active code with max_free_meals>0 "
+            "and servings_at_max>0)",
+            flush=True,
+        )
         return None
 
     payload = {k: v for k, v in best.items() if k != "_id"}
