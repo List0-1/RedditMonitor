@@ -193,17 +193,33 @@ def calculate_prospect_batch(
     country: str = "US",
     product_ids: list[str] | None = None,
     public_id: str | None = None,
-) -> dict[str, Any]:
-    """HAR boxprice: GET /gw/calculate/prospect/batch with voucher + all plan SKUs."""
+    zip_code: str | None = None,
+) -> tuple[dict[str, Any], str | None]:
+    """HAR boxprice batch. Returns (payload, zip_used).
+
+    Picks a fresh residential proxy, resolves its exit IP → lat/lng → ZIP via
+    Uber mapsSearch (DDSignup pattern), then prices with that zipCode.
+    """
+    from geo import zipcode_for_exit_ip
+    from proxies import get_active_ip
+
+    proxies = _fresh_proxies(session)
+    exit_ip = get_active_ip()
+    resolved_zip = zip_code or zipcode_for_exit_ip(exit_ip)
+
+    params: dict[str, str] = {
+        "hfCountryCode": country,
+        "hfPublicID": public_id or str(uuid.uuid4()),
+        "productIds": ",".join(product_ids or DEFAULT_PRODUCT_IDS),
+        "voucherCode": code,
+    }
+    if resolved_zip:
+        params["zipCode"] = str(resolved_zip).strip()
+
     resp = session.get(
         "https://www.hellofresh.com/gw/calculate/prospect/batch",
-        params={
-            "hfCountryCode": country,
-            "hfPublicID": public_id or str(uuid.uuid4()),
-            "productIds": ",".join(product_ids or DEFAULT_PRODUCT_IDS),
-            "voucherCode": code,
-        },
-        proxies=_fresh_proxies(session),
+        params=params,
+        proxies=proxies,
         headers=_browser_headers(
             Accept="*/*",
             Authorization=f"Bearer {access_token}",
@@ -219,7 +235,7 @@ def calculate_prospect_batch(
         timeout=15,
     )
     resp.raise_for_status()
-    return resp.json()
+    return resp.json(), resolved_zip
 
 
 def summarize_box_prices(batch: dict[str, Any]) -> dict[str, Any]:
@@ -295,6 +311,8 @@ def resolve_share_link(
         "final_url": None,
         "voucher": None,
         "box_pricing": None,
+        "zip_code": None,
+        "exit_ip": None,
         "error": None,
         "transient": False,
     }
@@ -342,6 +360,11 @@ def resolve_share_link(
             result["transient"] = True
             return result
 
+        # Exit IP tracked for logging; ZIP is resolved against the pricing-request proxy
+        from proxies import get_active_ip
+
+        result["exit_ip"] = get_active_ip()
+
         if check_details:
             try:
                 voucher = check_voucher(
@@ -359,13 +382,15 @@ def resolve_share_link(
 
         if check_box_prices:
             try:
-                batch = calculate_prospect_batch(
+                batch, zip_used = calculate_prospect_batch(
                     session,
                     code=code,
                     access_token=token,
                     referer=page.url,
                     country=country,
                 )
+                result["zip_code"] = zip_used
+                result["exit_ip"] = get_active_ip()
                 result["box_pricing"] = summarize_box_prices(batch)
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"box pricing unavailable: {exc}")
@@ -475,6 +500,10 @@ def format_promo_result(result: dict[str, Any]) -> str:
         return f"  error: {result.get('error') or 'no promo code'}"
 
     lines = [f"  promo_code: {code}"]
+    if result.get("zip_code"):
+        lines.append(f"  zip_code: {result['zip_code']} (from exit IP geo)")
+    elif result.get("exit_ip"):
+        lines.append(f"  zip_code: unavailable (exit IP {result['exit_ip']})")
     voucher = result.get("voucher")
     if voucher:
         lines.append(f"  offer: {format_offer_line(voucher)}")

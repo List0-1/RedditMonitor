@@ -27,7 +27,7 @@ MONGO_URI = os.environ.get(
 PROXIES_DB_NAME = "Proxies"
 BOTCONFIG_DB = "BotConfig"
 BOTCONFIG_COL = "DBControl"
-DEFAULT_PROXY_COLLECTION = "SharedDC_Oculus"
+DEFAULT_PROXY_COLLECTION = "Resi_Lightning"
 
 IP_TEST_URLS = (
     "https://api.ipify.org",
