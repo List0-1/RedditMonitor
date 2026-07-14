@@ -257,12 +257,18 @@ def calculate_prospect_batch(
 
 
 def summarize_box_prices(batch: dict[str, Any]) -> dict[str, Any]:
-    """From prospect/batch, find configs where box price (price-discount) is $0.
+    """From prospect/batch, find free-box configs (box $0 in checkout UI).
 
-    Returns max meals/week still free, plus every free config.
+    Selection rule (matches HelloFresh plan UI test):
+      1) Fix Servings per recipe = 2 (default)
+      2) Increase Your recipes per week 2→3→4→5→6
+      3) Keep the last recipes/week that is still free (implied box $0)
+
+    Free shipping alone does NOT count — e.g. 5×2 can be $9.90 box + $0 ship.
     """
     configs: list[dict[str, Any]] = []
     free: list[dict[str, Any]] = []
+    default_servings = 2  # Servings per recipe default
 
     for product in batch.get("products") or []:
         sku = product.get("id") or ""
@@ -276,6 +282,9 @@ def summarize_box_prices(batch: dict[str, Any]) -> dict[str, Any]:
         shipping_discount = money_to_float(product.get("shippingDiscount"))
         total = money_to_float(product.get("totalPrice"))
         box = round(price - discount, 2)
+        ship_due = round(max(shipping - shipping_discount, 0.0), 2)
+        # Match checkout UI: box due ≈ total − shipping due
+        implied_box = round(total - ship_due, 2)
         row = {
             "sku": sku,
             "meals": meals,
@@ -283,29 +292,36 @@ def summarize_box_prices(batch: dict[str, Any]) -> dict[str, Any]:
             "price": round(price, 2),
             "discount": round(discount, 2),
             "box_price": box,
+            "implied_box": implied_box,
             "shipping": round(shipping, 2),
             "shipping_discount": round(shipping_discount, 2),
+            "shipping_due": ship_due,
             "total": round(total, 2),
         }
         configs.append(row)
-        if abs(box) < 0.01:
+        if abs(implied_box) < 0.01:
             free.append(row)
 
     configs.sort(key=lambda r: (r["meals"], r["people"]))
     free.sort(key=lambda r: (r["meals"], r["people"]))
 
-    max_meals = max((r["meals"] for r in free), default=None)
+    # Walk recipes/week upward at servings_per_recipe=2; keep last free
+    free_at_default = [r for r in free if r["people"] == default_servings]
     best = None
-    if max_meals is not None:
-        # Prefer highest people-count among max free meals (bigger free box)
-        at_max = [r for r in free if r["meals"] == max_meals]
-        best = max(at_max, key=lambda r: r["people"])
+    max_meals = None
+    if free_at_default:
+        # Already sorted by meals; last free meals value is the max still free
+        best = max(free_at_default, key=lambda r: r["meals"])
+        max_meals = best["meals"]
 
     return {
-        "max_free_meals": max_meals,
+        "recipes_per_week": max_meals,  # UI: Your recipes per week
+        "servings_per_recipe": default_servings if max_meals is not None else None,
         "best_free": best,
         "free_configs": free,
         "all_configs": configs,
+        # legacy aliases
+        "max_free_meals": max_meals,
     }
 
 
@@ -471,36 +487,47 @@ def resolve_share_link(
 
 
 def pricing_metrics_from_result(result: dict[str, Any]) -> dict[str, Any] | None:
-    """Require max_free_meals, servings_at_max, shipping_at_max from box-pricing API.
+    """Require recipes_per_week, servings_per_recipe, shipping_at_max from API.
 
-    shipping_at_max may be 0.0 (free shipping) — that still counts as a real value.
-    Returns None when any of the three is missing from the API payload.
+    Field mapping (HelloFresh UI):
+      - recipes_per_week   = Your recipes per week
+      - servings_per_recipe = Servings per recipe
+      - shipping_at_max    = shipping due on that free-box config
+
+    Only true free-box configs are included (box $0 in checkout UI).
     """
     pricing = result.get("box_pricing")
     if not isinstance(pricing, dict):
         return None
-    meals = pricing.get("max_free_meals")
+    meals = pricing.get("recipes_per_week")
+    if meals is None:
+        meals = pricing.get("max_free_meals")
     best = pricing.get("best_free")
     if meals is None or not isinstance(best, dict):
         return None
     servings = best.get("people")
     if servings is None:
+        servings = pricing.get("servings_per_recipe")
+    if servings is None:
         return None
-    # shipping / shipping_discount must be present on the best_free row
-    if "shipping" not in best and "shipping_discount" not in best:
+    if "shipping" not in best and "shipping_discount" not in best and "shipping_due" not in best:
         return None
     try:
-        ship = float(best.get("shipping") or 0)
-        ship_disc = float(best.get("shipping_discount") or 0)
         meals_i = int(meals)
         servings_i = int(servings)
+        ship_fee = float(best.get("shipping") or 0)
+        ship_disc = float(best.get("shipping_discount") or 0)
+        if best.get("shipping_due") is not None:
+            ship_due = float(best.get("shipping_due"))
+        else:
+            ship_due = round(max(ship_fee - ship_disc, 0.0), 2)
     except (TypeError, ValueError):
         return None
     return {
-        "max_free_meals": meals_i,
-        "servings_at_max": servings_i,
-        "shipping_at_max": round(ship - ship_disc, 2),
-        "shipping_fee": round(ship, 2),
+        "recipes_per_week": meals_i,
+        "servings_per_recipe": servings_i,
+        "shipping_at_max": round(ship_due, 2),
+        "shipping_fee": round(ship_fee, 2),
         "shipping_discount": round(ship_disc, 2),
     }
 
@@ -510,7 +537,7 @@ def is_confirmed_dead_code(result: dict[str, Any]) -> bool:
 
     Observed for dead codes:
       - GET /gw/vouchers/{code} → HTTP 404, voucher=null
-      - box pricing may still return with max_free_meals=None / best_free=None
+      - box pricing may still return with recipes_per_week=None / best_free=None
       - OR voucher.is_active is False
     """
     if not result.get("promo_code"):
@@ -608,7 +635,7 @@ def resolve_share_link_with_retries(
                 return promo
 
             missing = (
-                "missing zip_code or max_free_meals/servings_at_max/shipping_at_max"
+                "missing zip_code or recipes_per_week/servings_per_recipe/shipping_at_max"
             )
             if not str(promo.get("zip_code") or "").strip():
                 missing = (
@@ -679,19 +706,26 @@ def format_promo_result(result: dict[str, Any]) -> str:
 
     pricing = result.get("box_pricing")
     if pricing:
-        max_meals = pricing.get("max_free_meals")
+        max_meals = pricing.get("recipes_per_week")
+        if max_meals is None:
+            max_meals = pricing.get("max_free_meals")
         best = pricing.get("best_free")
         if max_meals is None:
-            lines.append("  max_free_meals: none (no $0 box configs)")
-            lines.append("  servings_at_max: none")
+            lines.append("  recipes_per_week: none (no $0 box configs)")
+            lines.append("  servings_per_recipe: none")
         else:
             people = best.get("people") if best else "?"
-            lines.append(f"  max_free_meals: {max_meals}")
-            lines.append(f"  servings_at_max: {people}")
+            lines.append(f"  recipes_per_week: {max_meals}  # Your recipes per week")
+            lines.append(f"  servings_per_recipe: {people}  # Servings per recipe")
             if best:
-                ship = float(best.get("shipping") or 0)
-                ship_disc = float(best.get("shipping_discount") or 0)
-                ship_due = round(ship - ship_disc, 2)
+                if best.get("shipping_due") is not None:
+                    ship_due = float(best.get("shipping_due"))
+                    ship = float(best.get("shipping") or 0)
+                    ship_disc = float(best.get("shipping_discount") or 0)
+                else:
+                    ship = float(best.get("shipping") or 0)
+                    ship_disc = float(best.get("shipping_discount") or 0)
+                    ship_due = round(max(ship - ship_disc, 0.0), 2)
                 lines.append(
                     f"  shipping_at_max: ${ship_due:.2f} "
                     f"(fee ${ship:.2f} − discount ${ship_disc:.2f})"

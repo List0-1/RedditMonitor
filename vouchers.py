@@ -99,13 +99,31 @@ def _num(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def recipes_per_week_of(doc: dict[str, Any] | None) -> float:
+    """Your recipes per week (legacy: max_free_meals)."""
+    if not doc:
+        return 0.0
+    if doc.get("recipes_per_week") is not None:
+        return _num(doc.get("recipes_per_week"), 0.0)
+    return _num(doc.get("max_free_meals"), 0.0)
+
+
+def servings_per_recipe_of(doc: dict[str, Any] | None) -> float:
+    """Servings per recipe (legacy: servings_at_max)."""
+    if not doc:
+        return 0.0
+    if doc.get("servings_per_recipe") is not None:
+        return _num(doc.get("servings_per_recipe"), 0.0)
+    return _num(doc.get("servings_at_max"), 0.0)
+
+
 def is_bad_voucher(doc: dict[str, Any] | None) -> bool:
     """True for inactive or no usable free-box offer.
 
     Bad when:
       - active is False, OR
-      - max_free_meals is missing/0, OR
-      - servings_at_max is missing/0
+      - recipes_per_week (Your recipes per week) missing/0, OR
+      - servings_per_recipe (Servings per recipe) missing/0
 
     Bad docs stay in VoucherCodes and are skipped on each scan run.
     """
@@ -113,9 +131,7 @@ def is_bad_voucher(doc: dict[str, Any] | None) -> bool:
         return True
     if doc.get("active") is False:
         return True
-    meals = _num(doc.get("max_free_meals"), 0.0)
-    servings = _num(doc.get("servings_at_max"), 0.0)
-    return meals <= 0 or servings <= 0
+    return recipes_per_week_of(doc) <= 0 or servings_per_recipe_of(doc) <= 0
 
 
 def load_known() -> dict[str, set[str]]:
@@ -138,6 +154,8 @@ def load_known() -> dict[str, set[str]]:
             "promo_code": 1,
             "reddit_comment_id": 1,
             "active": 1,
+            "recipes_per_week": 1,
+            "servings_per_recipe": 1,
             "max_free_meals": 1,
             "servings_at_max": 1,
         },
@@ -221,8 +239,8 @@ def inactive_voucher_doc(
         "discount_value": None,
         "channel": None,
         "boxes": {},
-        "max_free_meals": (metrics or {}).get("max_free_meals", 0) or 0,
-        "servings_at_max": (metrics or {}).get("servings_at_max", 0) or 0,
+        "recipes_per_week": (metrics or {}).get("recipes_per_week", 0) or 0,
+        "servings_per_recipe": (metrics or {}).get("servings_per_recipe", 0) or 0,
         "shipping_at_max": (metrics or {}).get("shipping_at_max", 0) or 0,
         "shipping_fee": (metrics or {}).get("shipping_fee", 0) or 0,
         "shipping_discount": (metrics or {}).get("shipping_discount", 0) or 0,
@@ -251,7 +269,7 @@ def promo_result_to_doc(
 ) -> dict[str, Any] | None:
     """Build a VoucherCodes document from resolve_share_link() output.
 
-    Requires API pricing metrics (max_free_meals, servings_at_max, shipping_at_max).
+    Requires API pricing metrics (recipes_per_week, servings_per_recipe, shipping_at_max).
     Returns None when those are missing — caller must not save incomplete data.
     """
     from promo import format_offer_line, pricing_metrics_from_result
@@ -279,8 +297,9 @@ def promo_result_to_doc(
         "discount_value": voucher.get("discount_value"),
         "channel": voucher.get("channel"),
         "boxes": voucher.get("box_discounts") or {},
-        "max_free_meals": metrics["max_free_meals"],
-        "servings_at_max": metrics["servings_at_max"],
+        # HelloFresh UI field names
+        "recipes_per_week": metrics["recipes_per_week"],  # Your recipes per week
+        "servings_per_recipe": metrics["servings_per_recipe"],  # Servings per recipe
         "shipping_at_max": metrics["shipping_at_max"],
         "shipping_fee": metrics["shipping_fee"],
         "shipping_discount": metrics["shipping_discount"],
@@ -371,8 +390,8 @@ def comparable_snapshot(doc: dict[str, Any]) -> dict[str, Any]:
         "discount_value": doc.get("discount_value"),
         "channel": doc.get("channel"),
         "boxes": doc.get("boxes") or {},
-        "max_free_meals": doc.get("max_free_meals"),
-        "servings_at_max": doc.get("servings_at_max"),
+        "recipes_per_week": recipes_per_week_of(doc),
+        "servings_per_recipe": servings_per_recipe_of(doc),
         "shipping_at_max": doc.get("shipping_at_max"),
         "shipping_fee": doc.get("shipping_fee"),
         "shipping_discount": doc.get("shipping_discount"),
@@ -389,22 +408,20 @@ def voucher_rank_key(doc: dict[str, Any]) -> tuple[float, float, float]:
 
     Priority (best first):
       1) lowest shipping_at_max  (0 is best)
-      2) highest max_free_meals
-      3) highest servings_at_max
+      2) highest recipes_per_week (Your recipes per week)
+      3) highest servings_per_recipe (Servings per recipe)
     """
     shipping = _num(doc.get("shipping_at_max"), default=9999.0)
-    meals = _num(doc.get("max_free_meals"), default=-1.0)
-    servings = _num(doc.get("servings_at_max"), default=-1.0)
+    meals = recipes_per_week_of(doc)
+    servings = servings_per_recipe_of(doc)
     return (shipping, -meals, -servings)
 
 
 def _eligible_for_best(doc: dict[str, Any]) -> bool:
-    """Active with real free-box metrics (meals > 0 and servings > 0)."""
+    """Active with real free-box metrics (recipes>0 and servings>0)."""
     if doc.get("active") is not True:
         return False
-    meals = _num(doc.get("max_free_meals"), 0.0)
-    servings = _num(doc.get("servings_at_max"), 0.0)
-    return meals > 0 and servings > 0
+    return recipes_per_week_of(doc) > 0 and servings_per_recipe_of(doc) > 0
 
 
 def select_best_active_voucher(
@@ -429,13 +446,18 @@ def update_best_voucher_code(
     if best is None:
         col.delete_one({"_id": BEST_DOC_ID})
         print(
-            "BestVoucherCode: empty (no active code with max_free_meals>0 "
-            "and servings_at_max>0)",
+            "BestVoucherCode: empty (no active code with recipes_per_week>0 "
+            "and servings_per_recipe>0)",
             flush=True,
         )
         return None
 
     payload = {k: v for k, v in best.items() if k != "_id"}
+    # Normalize UI field names on BestVoucherCode
+    payload["recipes_per_week"] = int(recipes_per_week_of(best))
+    payload["servings_per_recipe"] = int(servings_per_recipe_of(best))
+    payload.pop("max_free_meals", None)
+    payload.pop("servings_at_max", None)
     payload["selected_at"] = now
     payload["updated_at"] = now
     col.replace_one({"_id": BEST_DOC_ID}, {"_id": BEST_DOC_ID, **payload}, upsert=True)
@@ -443,8 +465,8 @@ def update_best_voucher_code(
     print(
         f"BestVoucherCode → {payload.get('promo_code')} | "
         f"shipping_at_max={payload.get('shipping_at_max')} "
-        f"max_free_meals={payload.get('max_free_meals')} "
-        f"servings_at_max={payload.get('servings_at_max')}",
+        f"recipes_per_week={payload.get('recipes_per_week')} "
+        f"servings_per_recipe={payload.get('servings_per_recipe')}",
         flush=True,
     )
     return payload

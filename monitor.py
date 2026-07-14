@@ -316,8 +316,8 @@ def refresh_voucher_statuses(
                     code,
                     {
                         "active": False,
-                        "max_free_meals": 0,
-                        "servings_at_max": 0,
+                        "recipes_per_week": 0,
+                        "servings_per_recipe": 0,
                     },
                 )
                 print("    → marked inactive (kept for scan skip)", flush=True)

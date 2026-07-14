@@ -201,7 +201,7 @@ def _resolve_one(
     # Incomplete API pricing after retries — do NOT save (unknown good/bad)
     if promo.get("incomplete") or not has_required_api_pricing(promo):
         print(
-            "  → skip save (incomplete zip_code/max_free_meals/servings_at_max/shipping_at_max)",
+            "  → skip save (incomplete zip_code/recipes_per_week/servings_per_recipe/shipping_at_max)",
             flush=True,
         )
         out["failed"] += 1
