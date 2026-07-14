@@ -197,8 +197,8 @@ def calculate_prospect_batch(
 ) -> tuple[dict[str, Any], str | None]:
     """HAR boxprice batch. Returns (payload, zip_used).
 
-    Picks a fresh residential proxy, resolves its exit IP → lat/lng → ZIP via
-    Uber mapsSearch (DDSignup pattern), then prices with that zipCode.
+    Picks a fresh residential proxy, resolves exit IP → ip-api ZIP, then
+    prices with that zipCode.
     """
     from geo import zipcode_for_exit_ip
     from proxies import get_active_ip
@@ -501,7 +501,7 @@ def format_promo_result(result: dict[str, Any]) -> str:
 
     lines = [f"  promo_code: {code}"]
     if result.get("zip_code"):
-        lines.append(f"  zip_code: {result['zip_code']} (from exit IP geo)")
+        lines.append(f"  zip_code: {result['zip_code']} (ip-api)")
     elif result.get("exit_ip"):
         lines.append(f"  zip_code: unavailable (exit IP {result['exit_ip']})")
     voucher = result.get("voucher")
