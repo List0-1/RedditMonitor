@@ -38,58 +38,29 @@ THREAD_URL = (
 )
 PROMO_WORKERS = 10
 PROMO_MAX_ATTEMPTS = 5
-THREAD_FETCH_WORKERS = 4
 
 
 def _landing_url_for_code(code: str) -> str:
     return f"https://www.hellofresh.com/pages/meal-kit-delivery?c={quote(code)}"
 
 
-def _fetch_thread_comments(url: str) -> tuple[str, list[dict[str, Any]]]:
-    """Fetch + walk one thread; returns (url, comments)."""
-    from monitor import walk_comments
-
-    print(f"📡 Collecting from thread: {url}", flush=True)
-    comments = walk_comments(fetch_comments(url))
-    print(f"  ✓ {url} → {len(comments)} comments", flush=True)
-    return url, comments
-
-
 def collect_from_threads(
     thread_urls: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Visit threads in parallel; return (comments, inventory items).
+    """Visit threads sequentially; return (comments, inventory items).
 
     Each inventory item: {kind: share|code, value, comment, resolve_url}
     """
+    from monitor import walk_comments
+
     all_comments: list[dict[str, Any]] = []
     inventory: list[dict[str, Any]] = []
     seen_links: set[str] = set()
     seen_codes: set[str] = set()
 
-    if not thread_urls:
-        return all_comments, inventory
-
-    workers = min(THREAD_FETCH_WORKERS, len(thread_urls))
-    print(
-        f"\n📡 Collecting {len(thread_urls)} thread(s) in parallel "
-        f"(workers={workers})",
-        flush=True,
-    )
-    by_url: dict[str, list[dict[str, Any]]] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_fetch_thread_comments, url): url for url in thread_urls}
-        for fut in as_completed(futures):
-            url = futures[fut]
-            try:
-                _url, comments = fut.result()
-                by_url[_url] = comments
-            except Exception as exc:  # noqa: BLE001
-                print(f"  ✗ {url} failed: {exc}", flush=True)
-
-    # Stable order: same as thread_urls discovery order
     for url in thread_urls:
-        comments = by_url.get(url) or []
+        print(f"\n📡 Collecting from thread: {url}", flush=True)
+        comments = walk_comments(fetch_comments(url))
         all_comments.extend(comments)
         for comment in comments:
             for link in comment.get("share_links") or []:
