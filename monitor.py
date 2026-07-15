@@ -2,9 +2,9 @@
 """Monitor a Reddit thread for HelloFresh share links and resolve promo codes.
 
 Reddit (pure HTTP, no browser / no manual cookies):
-  1) curl_cffi Chrome TLS session
+  1) curl_cffi Safari TLS session (Chrome TLS is hard-blocked)
   2) Solve Reddit GET js_challenge (solution = token + token)
-  3) GET {thread}/.json?limit=500&raw_json=1
+  3) Parse old.reddit.com HTML comments (/.json is often 403)
 
 HelloFresh promo resolution (from hffindpromocode.har):
   1) Follow share link redirects -> ?c=PROMO_CODE
@@ -51,7 +51,9 @@ PROMO_CODE_RE = re.compile(
 
 def normalize_share_url(url: str) -> str | None:
     url = (
-        url.replace("\\_", "_")
+        url.replace("%5C_", "_")
+        .replace("%5c_", "_")
+        .replace("\\_", "_")
         .replace("&amp;", "&")
         .rstrip(".,;:!?*_~`\"')>]} ")
     )
@@ -72,7 +74,13 @@ def normalize_share_url(url: str) -> str | None:
 def extract_share_links(text: str) -> list[str]:
     if not text:
         return []
-    cleaned = text.replace("\\_", "_").replace("\\*", "*").replace("&amp;", "&")
+    cleaned = (
+        text.replace("%5C_", "_")
+        .replace("%5c_", "_")
+        .replace("\\_", "_")
+        .replace("\\*", "*")
+        .replace("&amp;", "&")
+    )
     found: list[str] = []
     seen: set[str] = set()
     for match in SHARE_RE.finditer(cleaned):

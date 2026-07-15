@@ -11,6 +11,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse, urlunparse
+from zoneinfo import ZoneInfo
+
+EST = ZoneInfo("America/New_York")
 
 from pymongo import ASCENDING, MongoClient
 from pymongo.collection import Collection
@@ -435,6 +438,18 @@ def select_best_active_voucher(
     return min(eligible, key=voucher_rank_key)
 
 
+def _check_time_fields(now: datetime | None = None) -> dict[str, Any]:
+    """CheckTimeEST / CheckTimeUNIX for BestVoucherCode updates."""
+    utc_now = now or datetime.now(timezone.utc)
+    if utc_now.tzinfo is None:
+        utc_now = utc_now.replace(tzinfo=timezone.utc)
+    est_now = utc_now.astimezone(EST)
+    return {
+        "CheckTimeEST": est_now.strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+        "CheckTimeUNIX": int(utc_now.timestamp()),
+    }
+
+
 def update_best_voucher_code(
     docs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
@@ -442,12 +457,17 @@ def update_best_voucher_code(
     best = select_best_active_voucher(docs)
     col = best_voucher_collection()
     now = datetime.now(timezone.utc)
+    check_times = _check_time_fields(now)
 
     if best is None:
-        col.delete_one({"_id": BEST_DOC_ID})
+        col.replace_one(
+            {"_id": BEST_DOC_ID},
+            {"_id": BEST_DOC_ID, **check_times},
+            upsert=True,
+        )
         print(
             "BestVoucherCode: empty (no active code with recipes_per_week>0 "
-            "and servings_per_recipe>0)",
+            f"and servings_per_recipe>0) | {check_times['CheckTimeEST']}",
             flush=True,
         )
         return None
@@ -460,13 +480,15 @@ def update_best_voucher_code(
     payload.pop("servings_at_max", None)
     payload["selected_at"] = now
     payload["updated_at"] = now
+    payload.update(check_times)
     col.replace_one({"_id": BEST_DOC_ID}, {"_id": BEST_DOC_ID, **payload}, upsert=True)
 
     print(
         f"BestVoucherCode → {payload.get('promo_code')} | "
         f"shipping_at_max={payload.get('shipping_at_max')} "
         f"recipes_per_week={payload.get('recipes_per_week')} "
-        f"servings_per_recipe={payload.get('servings_per_recipe')}",
+        f"servings_per_recipe={payload.get('servings_per_recipe')} | "
+        f"{payload['CheckTimeEST']}",
         flush=True,
     )
     return payload
