@@ -236,7 +236,12 @@ def calculate_prospect_batch(
         ),
         timeout=15,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        body = (resp.text or "")[:800].replace("\n", " ")
+        raise RuntimeError(
+            f"prospect/batch HTTP {resp.status_code} zip={resolved_zip} "
+            f"code={code} body={body!r}"
+        )
     return resp.json(), str(resolved_zip).strip()
 
 
@@ -444,11 +449,13 @@ def resolve_share_link(
                 result["zip_code"] = zip_used
                 result["exit_ip"] = get_active_ip()
                 result["box_pricing"] = summarize_box_prices(batch)
+                result["box_pricing_raw"] = _summarize_batch_response(batch)
                 # ZIP resolved — clear transient from voucher-only soft fails
                 # if pricing metrics are present (checked by caller).
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"box pricing unavailable: {exc}")
                 result["transient"] = True
+                result["box_pricing_error"] = str(exc)
                 if "zip_code unavailable" in str(exc).lower():
                     # Force outer retry / proxy swap
                     result["error"] = "; ".join(notes + [str(exc)])
@@ -544,6 +551,116 @@ def has_required_api_pricing(result: dict[str, Any]) -> bool:
     return pricing_metrics_from_result(result) is not None
 
 
+def _summarize_batch_response(batch: dict[str, Any]) -> dict[str, Any]:
+    """Compact prospect/batch payload for debug logs."""
+    products = batch.get("products") if isinstance(batch, dict) else None
+    if not isinstance(products, list):
+        keys = list(batch.keys())[:20] if isinstance(batch, dict) else []
+        return {"keys": keys, "products": 0, "sample": str(batch)[:400]}
+    sample: list[dict[str, Any]] = []
+    for product in products[:6]:
+        if not isinstance(product, dict):
+            continue
+        sample.append(
+            {
+                "id": product.get("id"),
+                "price": product.get("price"),
+                "discount": product.get("discount"),
+                "shippingFee": product.get("shippingFee"),
+                "shippingDiscount": product.get("shippingDiscount"),
+                "totalPrice": product.get("totalPrice"),
+            }
+        )
+    return {
+        "products": len(products),
+        "sample": sample,
+        "errors": batch.get("errors") or batch.get("error") or batch.get("message"),
+    }
+
+
+def incomplete_pricing_details(result: dict[str, Any]) -> dict[str, Any]:
+    """What failed + response snippets for incomplete pricing retries."""
+    pricing = result.get("box_pricing") if isinstance(result.get("box_pricing"), dict) else {}
+    best = pricing.get("best_free") if isinstance(pricing, dict) else None
+    missing: list[str] = []
+    if not str(result.get("zip_code") or "").strip():
+        missing.append("zip_code")
+    if not isinstance(pricing, dict) or not pricing:
+        missing.append("box_pricing")
+    else:
+        meals = pricing.get("recipes_per_week")
+        if meals is None:
+            meals = pricing.get("max_free_meals")
+        if meals is None:
+            missing.append("recipes_per_week")
+        servings = None
+        if isinstance(best, dict):
+            servings = best.get("people")
+        if servings is None:
+            servings = pricing.get("servings_per_recipe")
+        if servings is None:
+            missing.append("servings_per_recipe")
+        if not isinstance(best, dict):
+            missing.append("best_free/shipping_at_max")
+        elif (
+            "shipping" not in best
+            and "shipping_discount" not in best
+            and "shipping_due" not in best
+        ):
+            missing.append("shipping_at_max")
+
+    voucher = result.get("voucher") if isinstance(result.get("voucher"), dict) else {}
+    return {
+        "promo_code": result.get("promo_code"),
+        "missing": missing,
+        "zip_code": result.get("zip_code"),
+        "exit_ip": result.get("exit_ip"),
+        "error": result.get("error") or result.get("box_pricing_error"),
+        "voucher_active": voucher.get("is_active") if voucher else None,
+        "voucher_summary": {
+            "discount_type": voucher.get("discount_type"),
+            "discount_value": voucher.get("discount_value"),
+            "channel": voucher.get("channel"),
+        }
+        if voucher
+        else None,
+        "box_pricing": {
+            "recipes_per_week": pricing.get("recipes_per_week") if pricing else None,
+            "servings_per_recipe": pricing.get("servings_per_recipe") if pricing else None,
+            "best_free": best,
+            "free_configs": len(pricing.get("free_configs") or []) if pricing else 0,
+            "all_configs": len(pricing.get("all_configs") or []) if pricing else 0,
+        },
+        "box_pricing_raw": result.get("box_pricing_raw"),
+        "box_pricing_error": result.get("box_pricing_error"),
+    }
+
+
+def print_incomplete_pricing_debug(result: dict[str, Any], *, prefix: str = "   ") -> None:
+    """Print missing fields + API response when pricing is incomplete."""
+    import json
+
+    details = incomplete_pricing_details(result)
+    print(
+        f"{prefix}reason: missing={details['missing']} "
+        f"code={details.get('promo_code')!r} zip={details.get('zip_code')!r} "
+        f"exit_ip={details.get('exit_ip')!r}",
+        flush=True,
+    )
+    if details.get("error"):
+        print(f"{prefix}error: {details['error']}", flush=True)
+    if details.get("voucher_summary"):
+        print(f"{prefix}voucher: {details['voucher_summary']}", flush=True)
+    print(f"{prefix}box_pricing: {details['box_pricing']}", flush=True)
+    raw = details.get("box_pricing_raw") or details.get("box_pricing_error")
+    if raw:
+        try:
+            text = json.dumps(raw, default=str) if not isinstance(raw, str) else raw
+        except Exception:  # noqa: BLE001
+            text = str(raw)
+        print(f"{prefix}response: {text[:1200]}", flush=True)
+
+
 def resolve_share_link_with_retries(
     share_url: str,
     *,
@@ -618,8 +735,12 @@ def resolve_share_link_with_retries(
                 promo["incomplete"] = False
                 return promo
 
+            details = incomplete_pricing_details(promo)
+            missing_fields = details.get("missing") or []
             missing = (
-                "missing zip_code or recipes_per_week/servings_per_recipe/shipping_at_max"
+                "missing " + "/".join(missing_fields)
+                if missing_fields
+                else "incomplete pricing"
             )
             if not str(promo.get("zip_code") or "").strip():
                 missing = (
@@ -628,6 +749,29 @@ def resolve_share_link_with_retries(
             reason = err or missing
             promo["incomplete"] = True
             promo["error"] = reason if not err else f"{err}; {missing}"
+            promo["incomplete_details"] = details
+
+            print(
+                f"    incomplete pricing ({attempt}/{max_attempts}) "
+                f"code={code!r}:",
+                flush=True,
+            )
+            print_incomplete_pricing_debug(promo)
+
+            # Got a valid batch with configs but no free-box metrics → code issue,
+            # not a bad proxy. Don't burn the residential pool.
+            pricing = promo.get("box_pricing") if isinstance(promo.get("box_pricing"), dict) else {}
+            got_batch = bool(pricing.get("all_configs")) or bool(promo.get("box_pricing_raw"))
+            proxy_problem = _is_proxy_error(err) or _is_proxy_error(
+                promo.get("box_pricing_error")
+            )
+            if got_batch and not proxy_problem and "zip_code" not in missing_fields:
+                print(
+                    "    API responded but no free-box metrics — "
+                    "not a proxy issue; will not save",
+                    flush=True,
+                )
+                return promo
 
             if attempt >= max_attempts:
                 print(
@@ -636,11 +780,17 @@ def resolve_share_link_with_retries(
                 )
                 return promo
 
-            swap_proxy_on_failure(reason=reason[:120])
-            print(
-                f"    retry {attempt}/{max_attempts} after proxy swap: {reason}",
-                flush=True,
-            )
+            if proxy_problem or "zip_code" in missing_fields or not got_batch:
+                swap_proxy_on_failure(reason=reason[:120])
+                print(
+                    f"    retry {attempt}/{max_attempts} after proxy swap: {reason}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"    retry {attempt}/{max_attempts} (no proxy blacklist): {reason}",
+                    flush=True,
+                )
             time.sleep(0.4)
         return last
     finally:
