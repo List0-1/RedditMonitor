@@ -199,32 +199,16 @@ def calculate_prospect_batch(
 ) -> tuple[dict[str, Any], str]:
     """HAR boxprice batch. Returns (payload, zip_used).
 
-    Requires a ZIP from the exit IP (ip-api). If ZIP is unavailable, blacklist
-    the current proxy, swap, and retry until zip_attempts is exhausted.
+    ZIP from exit IP (ip-api), else NYC fallback 10001.
     """
-    from geo import zipcode_for_exit_ip
-    from proxies import get_active_ip, swap_proxy_on_failure
+    from geo import FALLBACK_ZIP, zipcode_for_exit_ip
+    from proxies import get_active_ip
 
+    del zip_attempts  # kept on signature for callers; ZIP always resolves via fallback
+    proxies = _fresh_proxies(session)
+    exit_ip = get_active_ip()
     forced_zip = str(zip_code).strip() if zip_code else ""
-    resolved_zip = forced_zip
-    proxies = None
-    exit_ip: str | None = None
-
-    for attempt in range(1, max(1, zip_attempts) + 1):
-        proxies = _fresh_proxies(session)
-        exit_ip = get_active_ip()
-        resolved_zip = forced_zip or (zipcode_for_exit_ip(exit_ip) or "")
-        if resolved_zip:
-            break
-        reason = f"zip_code unavailable (exit IP {exit_ip or '?'})"
-        print(f"    {reason} — swapping proxy ({attempt}/{zip_attempts})", flush=True)
-        swap_proxy_on_failure(reason=reason)
-
-    if not resolved_zip:
-        raise RuntimeError(
-            f"zip_code unavailable after {zip_attempts} proxies "
-            f"(last exit IP {exit_ip or '?'})"
-        )
+    resolved_zip = forced_zip or (zipcode_for_exit_ip(exit_ip) or FALLBACK_ZIP)
 
     params: dict[str, str] = {
         "hfCountryCode": country,

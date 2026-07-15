@@ -12,6 +12,8 @@ from typing import Any
 from curl_cffi import requests as crequests
 
 ZIP_RE = re.compile(r"^\d{5}$")
+# Used when ip-api has no ZIP for the exit IP (or lookup fails).
+FALLBACK_ZIP = "10001"  # NYC (Midtown)
 
 _geoip_cache: dict[str, dict[str, Any] | None] = {}
 _geoip_lock = threading.Lock()
@@ -60,12 +62,28 @@ def lookup_exit_geo(exit_ip: str) -> dict[str, Any] | None:
     return result
 
 
-def zipcode_for_exit_ip(exit_ip: str | None) -> str | None:
-    """exit IP → ip-api.com ZIP (cached via lookup_exit_geo)."""
+def zipcode_for_exit_ip(
+    exit_ip: str | None,
+    *,
+    fallback: str | None = FALLBACK_ZIP,
+) -> str | None:
+    """exit IP → ip-api.com ZIP (cached via lookup_exit_geo).
+
+    Falls back to NYC ZIP (10001) when geo has no ZIP or lookup fails.
+    """
     ip = str(exit_ip or "").strip()
-    if not ip:
-        return None
-    geo = lookup_exit_geo(ip)
-    if not geo:
-        return None
-    return geo.get("zip")
+    geo = lookup_exit_geo(ip) if ip else None
+    zip_code = (geo or {}).get("zip") if geo else None
+    if zip_code and ZIP_RE.fullmatch(str(zip_code)):
+        return str(zip_code)
+    fb = str(fallback or "").strip()
+    if fb and ZIP_RE.fullmatch(fb):
+        if ip:
+            print(
+                f"[GEO] no ZIP for exit IP {ip} — using fallback {fb}",
+                flush=True,
+            )
+        else:
+            print(f"[GEO] no exit IP — using fallback ZIP {fb}", flush=True)
+        return fb
+    return None
