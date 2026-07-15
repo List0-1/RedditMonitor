@@ -550,9 +550,9 @@ def resolve_share_link_with_retries(
     session: crequests.Session | None = None,
     country: str = "US",
     locale: str = "en-US",
-    max_attempts: int = 3,
+    max_attempts: int = 5,
 ) -> dict[str, Any]:
-    """Resolve share link; require pricing metrics; swap proxy and retry up to 3x."""
+    """Resolve share link; require pricing metrics; swap proxy and retry up to 5x."""
     import time
 
     from proxies import swap_proxy_on_failure

@@ -191,7 +191,7 @@ def resolve_links(
                 session=hf,
                 country=country,
                 locale=locale,
-                max_attempts=3,
+                max_attempts=5,
             )
             time.sleep(0.8)
     finally:
@@ -298,7 +298,7 @@ def refresh_voucher_statuses(
                 session=hf,
                 country=country,
                 locale=locale,
-                max_attempts=3,
+                max_attempts=5,
             )
             print(format_promo_result(promo), flush=True)
 
