@@ -36,8 +36,8 @@ from vouchers import (
 WORKER_COUNT = 10
 IDLE_SLEEP_S = 3.0
 MAX_LOGIN_ATTEMPTS = 3
-# ~30s of Gmail polling per attempt (3 attempts ≈ 90s before badAccount)
-IMAP_MAX_ROUNDS = 15
+# 1m30s of Gmail polling per attempt (45 × 2s); 3 attempts ≈ 4.5m before badAccount
+IMAP_MAX_ROUNDS = 45
 IMAP_POLL_SECONDS = 2
 MARKET_ORDER = ("US", "CA")
 

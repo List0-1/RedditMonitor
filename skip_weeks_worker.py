@@ -21,7 +21,8 @@ from proxies import assign_proxy, ensure_market_proxies, get_active_proxy
 WORKER_COUNT = 10
 SCAN_INTERVAL_S = 1800
 MAX_LOGIN_ATTEMPTS = 3
-IMAP_MAX_ROUNDS = 15
+# 1m30s of Gmail polling per attempt (45 × 2s)
+IMAP_MAX_ROUNDS = 45
 IMAP_POLL_SECONDS = 2
 MARKET_ORDER = ("US", "CA")
 

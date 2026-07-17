@@ -559,7 +559,7 @@ def _search_login_link_in_mail(
 def fetch_hellofresh_login_link(
     target_email: str,
     *,
-    max_rounds: int = 30,
+    max_rounds: int = 45,
     lookback_minutes: int = 5,
     poll_seconds: int = HELLOFRESH_POLL_SECONDS,
     after_utc: datetime | None = None,
