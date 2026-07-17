@@ -465,7 +465,7 @@ def run_monitor_loop(
     target = thread_url or "auto-discover pinned HelloFresh share-codes thread(s)"
     print(
         f"Monitoring {target}\n"
-        f"Reddit scan (US then CA, 10 workers each) every {reddit_interval}s | "
+        f"Reddit scan (US then CA, 30 workers each) every {reddit_interval}s | "
         f"status check (US+CA) every {status_interval}s\n"
         f"Proxy: {proxy_label(get_active_proxy())}",
         flush=True,
