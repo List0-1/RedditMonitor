@@ -582,15 +582,15 @@ def fetch_hellofresh_login_link(
             "(set GMAIL_IMAP_PASSWORD / GMAIL_IMAP_FALLBACK_PASSWORD or IMAP_JSON_PATH)"
         )
 
+    # Same window as NewOTP: HelloFresh Date is often earlier than start return.
+    # Stale links from prior starts are blocked via exclude_links/exclude_codes.
+    filter_time = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
     if after_utc is not None:
         if after_utc.tzinfo is None:
             after_utc = after_utc.replace(tzinfo=timezone.utc)
-        # Tight skew only. A 5m lookback re-admits older magic links from prior
-        # passwordless/start calls → finish 401 "token does not match".
-        filter_time = after_utc - timedelta(seconds=45)
-    else:
-        filter_time = datetime.now(timezone.utc) - timedelta(
-            minutes=lookback_minutes
+        filter_time = max(
+            filter_time,
+            after_utc - timedelta(minutes=lookback_minutes),
         )
     skip_links = {(_clean_url(u) if u else "") for u in (exclude_links or set())}
     skip_links.discard("")
