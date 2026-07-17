@@ -200,7 +200,8 @@ def mark_bad_account(
 def claim_pending_skip_email(*, market: str = "US") -> dict[str, Any] | None:
     """Claim one email needing skip after referral worker (loggedCheck=True).
 
-    Requires loggedCheck=True, SkippedWeeks != True, badAccount != True.
+    Requires loggedCheck=True, SkippedWeeks != True, badAccount != True,
+    skipFailed != True (permanent skip-backup failure after max attempts).
     """
     now = datetime.now(timezone.utc)
     stale = now - SKIP_CLAIM_TTL
@@ -210,6 +211,7 @@ def claim_pending_skip_email(*, market: str = "US") -> dict[str, Any] | None:
             "loggedCheck": True,
             "SkippedWeeks": {"$ne": True},
             "badAccount": {"$ne": True},
+            "skipFailed": {"$ne": True},
             "$or": [
                 {"skip_processing": {"$ne": True}},
                 {"skip_processing_at": {"$lt": stale}},
@@ -259,6 +261,7 @@ def mark_skipped_weeks(
         {
             "$set": {
                 "SkippedWeeks": True,
+                "skipFailed": False,
                 "skip_processing": False,
                 "skipped_at": now,
                 "updated_at": now,
@@ -266,6 +269,28 @@ def mark_skipped_weeks(
                 "skip_kept_week": kept_week,
                 "skip_paused_weeks": paused_weeks or [],
                 "skip_subscription_id": subscription_id,
+            }
+        },
+    )
+
+
+def mark_skip_failed(
+    email: str, *, error: str | None = None, market: str = "US"
+) -> None:
+    """Permanent skip-backup failure — never claim again for skip weeks."""
+    now = datetime.now(timezone.utc)
+    checkout_collection(market).update_one(
+        {"email": (email or "").strip().lower()},
+        {
+            "$set": {
+                "skipFailed": True,
+                "SkippedWeeks": False,
+                "skip_processing": False,
+                "skip_failed_at": now,
+                "updated_at": now,
+                "last_skip_error": (
+                    str(error)[:500] if error else "skip_backup_failed"
+                ),
             }
         },
     )

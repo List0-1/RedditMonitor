@@ -1022,6 +1022,21 @@ def format_promo_result(result: dict[str, Any]) -> str:
             box_txt = ", ".join(f"box{k}={v}" for k, v in boxes.items())
             lines.append(f"  boxes: {box_txt}")
 
+    vv = result.get("voucher_validate")
+    if vv is None:
+        lines.append("  validate: (not run)")
+    elif is_validate_hard_fail(vv):
+        lines.append(
+            f"  validate: REJECTED code={vv.get('error_code')} msg={vv.get('msg')}"
+        )
+    elif vv.get("http_status") in (200, 201) or vv.get("status") in ("success", "ok"):
+        lines.append("  validate: ok")
+    else:
+        lines.append(
+            f"  validate: HTTP {vv.get('http_status')} code={vv.get('error_code')} "
+            f"msg={vv.get('msg')}"
+        )
+
     pricing = result.get("box_pricing")
     if pricing:
         max_meals = pricing.get("recipes_per_week")

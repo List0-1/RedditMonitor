@@ -60,6 +60,19 @@ def _base_headers(market: str = "US", **extra: str) -> dict[str, str]:
     return headers
 
 
+def _guest_token_from_json(data: Any) -> str | None:
+    """access_token from passwordless/start JSON (flat or nested)."""
+    if not isinstance(data, dict):
+        return None
+    for obj in (data, data.get("data"), data.get("token")):
+        if not isinstance(obj, dict):
+            continue
+        token = obj.get("access_token")
+        if isinstance(token, str) and token.startswith("eyJ"):
+            return token
+    return None
+
+
 def request_passwordless_link(
     email: str,
     *,
@@ -67,8 +80,11 @@ def request_passwordless_link(
     market: str = "US",
     country: str | None = None,
     locale: str | None = None,
-) -> bool:
-    """POST /gw/v1/passwordless/start — triggers login email."""
+) -> str | None:
+    """POST /gw/v1/passwordless/start — triggers login email.
+
+    Returns the guest JWT used for start (must be reused for magic-link/finish).
+    """
     mkt = _market_cfg(market)
     country = country or mkt["country"]
     locale = locale or mkt["locale"]
@@ -76,7 +92,7 @@ def request_passwordless_link(
     target = (email or "").strip().lower()
     session = _session(proxy)
     try:
-        session.get(
+        login_resp = session.get(
             f"{origin}/login",
             headers=_base_headers(
                 mkt["code"],
@@ -85,6 +101,19 @@ def request_passwordless_link(
             ),
             timeout=25,
         )
+        guest_token = extract_guest_token(login_resp.text or "")
+        if not guest_token:
+            home_resp = session.get(
+                f"{origin}/",
+                headers=_base_headers(
+                    mkt["code"],
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer=f"{origin}/",
+                ),
+                timeout=25,
+            )
+            guest_token = extract_guest_token(home_resp.text or "")
+
         payload = {
             "email": target,
             "channel": "email",
@@ -92,24 +121,37 @@ def request_passwordless_link(
             "redirect_url": _redirect_url_encoded(mkt["code"]),
             "public_id": str(uuid.uuid4()),
         }
+        start_headers = _base_headers(
+            mkt["code"],
+            **{
+                "content-type": "text/plain;charset=UTF-8",
+                "referer": f"{origin}/login",
+                "x-requested-by": "activations-rte",
+            },
+        )
+        if guest_token:
+            start_headers["authorization"] = f"Bearer {guest_token}"
         resp = session.post(
             f"{origin}/gw/v1/passwordless/start?country={country}&locale={locale}",
             data=json.dumps(payload, separators=(",", ":")),
-            headers=_base_headers(
-                mkt["code"],
-                **{
-                    "content-type": "text/plain;charset=UTF-8",
-                    "referer": f"{origin}/login",
-                    "x-requested-by": "activations-rte",
-                },
-            ),
+            headers=start_headers,
             timeout=25,
         )
+        if resp.status_code in (200, 204) and resp.text:
+            try:
+                body_token = _guest_token_from_json(resp.json())
+            except json.JSONDecodeError:
+                body_token = None
+            if body_token:
+                guest_token = body_token
         print(
-            f"[HF] passwordless/start ({mkt['code']}) {target} → HTTP {resp.status_code}",
+            f"[HF] passwordless/start ({mkt['code']}) {target} → HTTP {resp.status_code} "
+            f"(guest={'yes' if guest_token else 'no'})",
             flush=True,
         )
-        return resp.status_code in (200, 204)
+        if resp.status_code in (200, 204):
+            return guest_token
+        return None
     finally:
         session.close()
 
@@ -404,14 +446,20 @@ def login_and_get_referral(
     *,
     proxy: dict[str, str] | None = None,
     market: str | None = None,
+    start_guest_token: str | None = None,
 ) -> dict[str, Any]:
     """Finish passwordless login and return referral share link + metadata."""
-    code, guest_token, mkt_code = resolve_magic_link(
+    code, page_guest, mkt_code = resolve_magic_link(
         login_url, proxy=proxy, market=market
     )
+    finish_guest = start_guest_token or page_guest
+    if start_guest_token:
+        print("[HF] finish with start_guest", flush=True)
+    else:
+        print("[HF] finish with page_guest", flush=True)
     tokens = finish_magic_link(
         code,
-        guest_token=guest_token,
+        guest_token=finish_guest,
         proxy=proxy,
         email=email,
         market=mkt_code,
@@ -504,8 +552,8 @@ def fetch_referral_for_email(
     mkt = _market_cfg(market)
     after = datetime.now(timezone.utc)
     print(f"[HF] 1/3 passwordless/start ({mkt['code']}) → {target}", flush=True)
-    ok = request_passwordless_link(target, proxy=proxy, market=mkt["code"])
-    if not ok:
+    start_guest = request_passwordless_link(target, proxy=proxy, market=mkt["code"])
+    if not start_guest:
         raise RuntimeError("passwordless/start failed")
 
     print("[HF] 2/3 polling Gmail for login link…", flush=True)
@@ -520,6 +568,38 @@ def fetch_referral_for_email(
     print(f"[HF] login link: {login_url[:80]}…", flush=True)
 
     print("[HF] 3/3 finishing login + fetching referral…", flush=True)
-    return login_and_get_referral(
-        target, login_url, proxy=proxy, market=mkt["code"]
-    )
+
+    def _finish(start_token: str | None, url: str) -> dict[str, Any]:
+        return login_and_get_referral(
+            target,
+            url,
+            proxy=proxy,
+            market=mkt["code"],
+            start_guest_token=start_token,
+        )
+
+    try:
+        return _finish(start_guest, login_url)
+    except Exception as exc:
+        err = str(exc)
+        err_l = err.lower()
+        if "token does not match" not in err_l and "http 401" not in err_l:
+            raise
+        print(
+            "[HF] magic-link token mismatch — restarting passwordless once",
+            flush=True,
+        )
+        after = datetime.now(timezone.utc)
+        start_guest = request_passwordless_link(target, proxy=proxy, market=mkt["code"])
+        if not start_guest:
+            raise RuntimeError("passwordless/start failed") from exc
+        login_url = fetch_hellofresh_login_link(
+            target,
+            after_utc=after,
+            max_rounds=max_rounds,
+            poll_seconds=poll_seconds,
+        )
+        if not login_url:
+            raise RuntimeError("No HelloFresh login link in Gmail") from exc
+        print(f"[HF] login link (retry): {login_url[:80]}…", flush=True)
+        return _finish(start_guest, login_url)

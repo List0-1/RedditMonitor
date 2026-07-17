@@ -10,6 +10,7 @@ from typing import Any
 
 from checkout_emails import (
     claim_pending_skip_email,
+    mark_skip_failed,
     mark_skipped_weeks,
     release_skip_claim,
 )
@@ -82,15 +83,20 @@ def process_skip_email(
                     flush=True,
                 )
                 return
+            # Login worked but pause incomplete — count as a failed attempt
             err = "skip_weeks_failed_or_incomplete"
             if skipped.get("failed_weeks"):
                 err = str(skipped.get("failed_weeks"))[:500]
-            release_skip_claim(email, error=err, market=mkt["code"])
+            last_error = RuntimeError(err)
             print(
-                f"{tag} Skip incomplete for {email}; will retry next scan",
+                f"{tag} attempt {attempt}/{MAX_LOGIN_ATTEMPTS} incomplete "
+                f"for {email}: {err}",
                 flush=True,
             )
-            return
+            if attempt < MAX_LOGIN_ATTEMPTS:
+                time.sleep(2.0)
+                continue
+            break
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             print(
@@ -101,10 +107,10 @@ def process_skip_email(
                 time.sleep(2.0)
 
     err_msg = str(last_error) if last_error else "skip_backup_failed"
-    release_skip_claim(email, error=err_msg, market=mkt["code"])
+    mark_skip_failed(email, error=err_msg, market=mkt["code"])
     print(
-        f"{tag} Released claim after {MAX_LOGIN_ATTEMPTS} failures: "
-        f"{email} ({err_msg})",
+        f"{tag} skipFailed=true after {MAX_LOGIN_ATTEMPTS} failures "
+        f"(no further skip retries): {email} ({err_msg})",
         flush=True,
     )
 
