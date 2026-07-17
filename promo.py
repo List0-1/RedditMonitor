@@ -152,12 +152,18 @@ def _proxies_of(session: crequests.Session) -> dict[str, str] | None:
     return getattr(session, "_rm_proxies", None)
 
 
-def _fresh_proxies(
+def _session_proxies(
     session: crequests.Session,
     *,
     market: str | None = None,
 ) -> dict[str, str] | None:
-    """Rotate to a new proxy for this HTTP call and attach it to the session."""
+    """Reuse the proxy bound to this promo resolve (one proxy per code/attempt).
+
+    Only assigns a new pretest-ed proxy when the session has none yet.
+    """
+    existing = _proxies_of(session)
+    if existing is not None:
+        return existing
     from proxies import assign_proxy
 
     mkt = market or getattr(session, "_rm_market", None)
@@ -177,7 +183,7 @@ def check_voucher(
     resp = session.get(
         f"{origin}/gw/vouchers/{code}",
         params={"country": country, "locale": locale},
-        proxies=_fresh_proxies(session),
+        proxies=_session_proxies(session),
         headers=_browser_headers(
             Accept="application/json, text/plain, */*",
             Authorization=f"Bearer {access_token}",
@@ -225,7 +231,7 @@ def validate_voucher(
     resp = session.post(
         f"{origin}/gw/voucher/validate",
         json=body,
-        proxies=_fresh_proxies(session),
+        proxies=_session_proxies(session),
         headers=_browser_headers(
             Accept="application/json, text/plain, */*",
             Authorization=f"Bearer {access_token}",
@@ -319,7 +325,7 @@ def calculate_prospect_batch(
     from proxies import get_active_ip
 
     del zip_attempts  # kept on signature for callers; ZIP always resolves via fallback
-    proxies = _fresh_proxies(session)
+    proxies = _session_proxies(session)
     exit_ip = get_active_ip()
     forced_zip = str(zip_code).strip() if zip_code else ""
     # CA uses a Canadian postal fallback when geo lookup fails
@@ -485,6 +491,8 @@ def resolve_share_link(
         session._rm_proxies = proxies  # type: ignore[attr-defined]
     if market:
         session._rm_market = str(market).upper()  # type: ignore[attr-defined]
+    # Bind one proxy for this entire resolve (share → voucher → validate → batch)
+    _session_proxies(session, market=market)
     result: dict[str, Any] = {
         "share_url": share_url,
         "promo_code": None,
@@ -504,7 +512,7 @@ def resolve_share_link(
     try:
         page = session.get(
             share_url,
-            proxies=_fresh_proxies(session, market=market),
+            proxies=_session_proxies(session, market=market),
             headers=_browser_headers(Accept="text/html,application/xhtml+xml,*/*"),
             allow_redirects=True,
             timeout=10,
@@ -851,16 +859,25 @@ def resolve_share_link_with_retries(
     max_attempts: int = 5,
     market: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve share link; require pricing metrics; swap proxy and retry up to 5x."""
+    """Resolve share link; one proxy per attempt; swap only between retries."""
     import time
 
-    from proxies import swap_proxy_on_failure
+    from proxies import assign_proxy, mark_proxy_broken
 
     own = session is None
     session = session or create_hf_session()
+    if market:
+        session._rm_market = str(market).upper()  # type: ignore[attr-defined]
     last: dict[str, Any] = {}
+
+    def _bind_attempt_proxy() -> None:
+        """One pretest-ed proxy for all HF calls in this promo attempt."""
+        session._rm_proxies = None  # type: ignore[attr-defined]
+        assign_proxy(session, market=market)
+
     try:
         for attempt in range(1, max_attempts + 1):
+            _bind_attempt_proxy()
             try:
                 promo = resolve_share_link(
                     share_url,
@@ -889,7 +906,7 @@ def resolve_share_link_with_retries(
             if code and dead:
                 # Prefer having a ZIP on the doc; one more swap if pricing never ran
                 if not str(promo.get("zip_code") or "").strip() and attempt < max_attempts:
-                    swap_proxy_on_failure(reason="dead code missing zip_code")
+                    mark_proxy_broken(reason="dead code missing zip_code")
                     print(
                         f"    dead code {code} — retry {attempt}/{max_attempts} for zip_code",
                         flush=True,
@@ -965,7 +982,7 @@ def resolve_share_link_with_retries(
                 return promo
 
             if proxy_problem or "zip_code" in missing_fields or not got_batch:
-                swap_proxy_on_failure(reason=reason[:120])
+                mark_proxy_broken(reason=reason[:120])
                 print(
                     f"    retry {attempt}/{max_attempts} after proxy swap: {reason}",
                     flush=True,

@@ -364,6 +364,7 @@ def next_proxy(*, prefer_different: bool = True) -> dict[str, str] | None:
 
 def _next_market_proxy(market: str) -> dict[str, str] | None:
     """Pick + pretest a proxy from the market pool (skips broken ones)."""
+    global _active_proxy, _active_ip
     key = (market or "US").upper()
     ensure_market_proxies(key)
     with _proxies_lock:
@@ -379,6 +380,8 @@ def _next_market_proxy(market: str) -> dict[str, str] | None:
         candidates or rows, max_tries=PROXY_PICK_TRIES, quiet=True
     )
     if proxy and ip:
+        _active_proxy = proxy
+        _active_ip = ip
         with _proxies_lock:
             _cycle_ips.add(ip)
         return proxy
@@ -391,7 +394,7 @@ def assign_proxy(
     max_attempts: int = 3,
     market: str | None = None,
 ) -> dict[str, str] | None:
-    """Rotate to a pretest-ed unique-IP proxy; retry up to 3 times if pick fails."""
+    """Assign one pretest-ed proxy for a promo resolve (bind to session)."""
     proxy = None
     for attempt in range(1, max_attempts + 1):
         proxy = _next_market_proxy(market) if market else next_proxy()
