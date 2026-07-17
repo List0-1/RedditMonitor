@@ -27,11 +27,13 @@ MARKET_ORDER = ("US", "CA")
 
 
 def skip_result_ok(skipped: dict[str, Any] | None) -> bool:
-    """True when skip succeeded or only the first week exists (no failures)."""
+    """True when pause worked, or deliveries had nothing able to skip."""
     if not skipped:
         return False
     if skipped.get("failed_weeks"):
         return False
+    if skipped.get("nothing_to_skip"):
+        return True
     paused = skipped.get("paused_weeks") or []
     kept = skipped.get("kept_week")
     if paused:

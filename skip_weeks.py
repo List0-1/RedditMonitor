@@ -206,11 +206,19 @@ def pause_week(
 
 
 def _can_pause(week: dict[str, Any]) -> bool:
+    """True only when deliveries lists allowedActions.pause == true.
+
+    From skipweekcheck.har: first RUNNING week has pause=false; already-PAUSED
+    later weeks may still show pause=true but are not skip targets.
+    """
     actions = week.get("allowedActions")
     if isinstance(actions, dict) and "pause" in actions:
         return bool(actions.get("pause"))
-    # If API omits allowedActions, treat RUNNING as pausable.
-    return str(week.get("status") or "").upper() == "RUNNING"
+    return False
+
+
+def _is_running(week: dict[str, Any]) -> bool:
+    return str(week.get("status") or "").upper() == "RUNNING" and bool(week.get("id"))
 
 
 def skip_all_weeks_except_first(
@@ -220,45 +228,48 @@ def skip_all_weeks_except_first(
     market: str = "US",
     subscription_id: int | None = None,
 ) -> dict[str, Any]:
-    """Keep the first RUNNING week; PAUSE every later pausable week.
+    """Keep the first RUNNING week; PAUSE later RUNNING weeks with pause allowed.
 
-    Matches the deliveries UI: first box ships, later weeks show skipped (X).
+    Matches skipweekcheck.har: GET /me/deliveries first. If no later week is
+    RUNNING with ``allowedActions.pause: true``, do not PATCH anything.
     """
     mkt = _market_cfg(market)
     sub_id = subscription_id or fetch_subscription_id(
         access_token, proxy=proxy, market=mkt["code"]
     )
     weeks = list_delivery_weeks(access_token, proxy=proxy, market=mkt["code"])
-    running = [
-        w
-        for w in weeks
-        if str(w.get("status") or "").upper() == "RUNNING" and w.get("id")
-    ]
-    if not running:
-        print(f"[HF] skip-weeks ({mkt['code']}): no RUNNING weeks", flush=True)
+    running = [w for w in weeks if _is_running(w)]
+    kept = running[0] if running else None
+    # Only attempt pause on later RUNNING weeks the API says are pausable.
+    to_skip = [w for w in running[1:] if _can_pause(w)]
+
+    if not to_skip:
+        kept_id = kept.get("id") if kept else None
+        print(
+            f"[HF] skip-weeks ({mkt['code']}): no weeks able to skip "
+            f"(kept={kept_id}, running={len(running)}) — not attempting pause",
+            flush=True,
+        )
         return {
             "subscription_id": sub_id,
-            "kept_week": None,
+            "kept_week": kept_id,
             "paused_weeks": [],
             "failed_weeks": [],
+            "nothing_to_skip": True,
         }
 
-    kept = running[0]
-    to_skip = running[1:]
     paused: list[str] = []
     failed: list[dict[str, str]] = []
+    kept_id = kept.get("id") if kept else None
 
     print(
-        f"[HF] skip-weeks ({mkt['code']}): keep {kept.get('id')}, "
+        f"[HF] skip-weeks ({mkt['code']}): keep {kept_id}, "
         f"pause {len(to_skip)} later week(s)",
         flush=True,
     )
 
     for week in to_skip:
         week_id = str(week["id"])
-        if not _can_pause(week):
-            print(f"[HF] skip-weeks: {week_id} pause not allowed — skip", flush=True)
-            continue
         try:
             pause_week(
                 access_token,
@@ -275,7 +286,8 @@ def skip_all_weeks_except_first(
 
     return {
         "subscription_id": sub_id,
-        "kept_week": kept.get("id"),
+        "kept_week": kept_id,
         "paused_weeks": paused,
         "failed_weeks": failed,
+        "nothing_to_skip": False,
     }
