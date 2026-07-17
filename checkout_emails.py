@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pymongo import ASCENDING, ReturnDocument
 from pymongo.collection import Collection
@@ -14,6 +15,7 @@ from market import get_market
 from vouchers import get_client
 
 HF_DB = "HelloFresh"
+EST = ZoneInfo("America/New_York")
 
 # williamturner19978+{tag}@gmail.com
 EMAIL_RE = re.compile(
@@ -23,6 +25,19 @@ EMAIL_RE = re.compile(
 
 CLAIM_TTL = timedelta(minutes=10)
 SKIP_CLAIM_TTL = timedelta(minutes=15)
+MAX_LOGIN_ATTEMPTS = 3
+LOGIN_RETRY_GAP = timedelta(minutes=15)
+
+
+def _attempt_time_fields(now: datetime | None = None) -> dict[str, Any]:
+    utc_now = now or datetime.now(timezone.utc)
+    if utc_now.tzinfo is None:
+        utc_now = utc_now.replace(tzinfo=timezone.utc)
+    est_now = utc_now.astimezone(EST)
+    return {
+        "lastAttemptUNIX": int(utc_now.timestamp()),
+        "lastAttemptEST": est_now.strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+    }
 
 
 def is_allowed_email(email: str) -> bool:
@@ -78,6 +93,9 @@ def save_checkout_email(email: str, *, market: str = "US") -> dict[str, Any]:
         "loggedCheck": False,
         "processing": False,
         "SkippedWeeks": False,
+        "loginAttempts": 0,
+        "lastAttemptUNIX": None,
+        "lastAttemptEST": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -107,17 +125,41 @@ def save_checkout_email(email: str, *, market: str = "US") -> dict[str, Any]:
 
 
 def claim_pending_email(*, market: str = "US") -> dict[str, Any] | None:
-    """Atomically claim one CheckoutEmail that still needs loggedCheck."""
+    """Claim one CheckoutEmail for a single login attempt.
+
+    Eligible when not logged/blacklisted, ``loginAttempts`` < 3, and either no
+    prior attempt or ``lastAttemptUNIX`` is at least 15 minutes ago.
+    Increments ``loginAttempts`` and sets ``lastAttemptUNIX`` / ``lastAttemptEST``.
+    """
     now = datetime.now(timezone.utc)
     stale = now - CLAIM_TTL
+    gap_before = int((now - LOGIN_RETRY_GAP).timestamp())
     col = checkout_collection(market)
     return col.find_one_and_update(
         {
             "loggedCheck": {"$ne": True},
-            "$or": [
-                {"processing": {"$ne": True}},
-                {"processing_at": {"$lt": stale}},
-                {"processing_at": {"$exists": False}},
+            "badAccount": {"$ne": True},
+            "$and": [
+                {
+                    "$or": [
+                        {"loginAttempts": {"$exists": False}},
+                        {"loginAttempts": {"$lt": MAX_LOGIN_ATTEMPTS}},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"lastAttemptUNIX": {"$exists": False}},
+                        {"lastAttemptUNIX": None},
+                        {"lastAttemptUNIX": {"$lte": gap_before}},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"processing": {"$ne": True}},
+                        {"processing_at": {"$lt": stale}},
+                        {"processing_at": {"$exists": False}},
+                    ]
+                },
             ],
         },
         {
@@ -125,7 +167,9 @@ def claim_pending_email(*, market: str = "US") -> dict[str, Any] | None:
                 "processing": True,
                 "processing_at": now,
                 "updated_at": now,
-            }
+                **_attempt_time_fields(now),
+            },
+            "$inc": {"loginAttempts": 1},
         },
         sort=[("created_at", ASCENDING)],
         return_document=ReturnDocument.AFTER,

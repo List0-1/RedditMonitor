@@ -594,32 +594,6 @@ def fetch_referral_for_email(
             start_guest_token=start_token,
         )
 
-    try:
-        return _finish(start_guest, login_url)
-    except Exception as exc:
-        err = str(exc)
-        err_l = err.lower()
-        if "token does not match" not in err_l and "http 401" not in err_l:
-            raise
-        stale_code = extract_finish_code(login_url) or ""
-        print(
-            "[HF] magic-link token mismatch — restarting passwordless once "
-            f"(excluding stale code={stale_code[:12]}…)",
-            flush=True,
-        )
-        after = datetime.now(timezone.utc)
-        start_guest = request_passwordless_link(target, proxy=proxy, market=mkt["code"])
-        if not start_guest:
-            raise RuntimeError("passwordless/start failed") from exc
-        login_url = fetch_hellofresh_login_link(
-            target,
-            after_utc=after,
-            max_rounds=max_rounds,
-            poll_seconds=poll_seconds,
-            exclude_links={login_url},
-            exclude_codes={stale_code} if stale_code else None,
-        )
-        if not login_url:
-            raise RuntimeError("No HelloFresh login link in Gmail") from exc
-        print(f"[HF] login link (retry): {login_url[:80]}…", flush=True)
-        return _finish(start_guest, login_url)
+    # One start → one Gmail poll → one finish per claim.
+    # Outer worker retries after ≥15m (up to 3 claims); no in-process restart.
+    return _finish(start_guest, login_url)

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from checkout_emails import (
+    MAX_LOGIN_ATTEMPTS,
     claim_pending_email,
     mark_bad_account,
     mark_logged_check,
@@ -35,8 +36,7 @@ from vouchers import (
 
 WORKER_COUNT = 10
 IDLE_SLEEP_S = 3.0
-MAX_LOGIN_ATTEMPTS = 3
-# 1m30s of Gmail polling per attempt (45 × 2s); 3 attempts ≈ 4.5m before badAccount
+# One login try per claim; retries need ≥15m gap (see checkout_emails.LOGIN_RETRY_GAP)
 IMAP_MAX_ROUNDS = 45
 IMAP_POLL_SECONDS = 2
 MARKET_ORDER = ("US", "CA")
@@ -98,75 +98,79 @@ def process_checkout_email(
     worker_id: int,
     market: str,
 ) -> None:
+    """One passwordless login try per claim (claim already bumped loginAttempts)."""
     mkt = get_market(market)
     email = (doc.get("email") or "").strip().lower()
+    attempt = int(doc.get("loginAttempts") or 1)
     tag = f"[W{worker_id}:{mkt['code']}]"
-    print(f"{tag} Processing {email}", flush=True)
-
-    last_error: Exception | None = None
-    for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
-        proxy = assign_proxy(market=mkt["code"]) or get_active_proxy()
-        print(
-            f"{tag} login attempt {attempt}/{MAX_LOGIN_ATTEMPTS} for {email}",
-            flush=True,
-        )
-        try:
-            result = fetch_referral_for_email(
-                email,
-                proxy=proxy,
-                market=mkt["code"],
-                max_rounds=IMAP_MAX_ROUNDS,
-                poll_seconds=IMAP_POLL_SECONDS,
-            )
-            skipped = result.get("skipped_weeks") or {}
-            paused = skipped.get("paused_weeks") or []
-            if paused:
-                print(
-                    f"{tag} Paused {len(paused)} delivery week(s) for {email}",
-                    flush=True,
-                )
-            print(
-                f"{tag} Referral {email} → {result['referral_link']}",
-                flush=True,
-            )
-            mark_logged_check(
-                email,
-                referral_link=result["referral_link"],
-                customer_uuid=result.get("customer_uuid"),
-                first_name=result.get("first_name"),
-                invite_link_code=result.get("invite_link_code"),
-                discount_voucher=result.get("discount_voucher"),
-                market=mkt["code"],
-            )
-            if skip_result_ok(skipped):
-                mark_skipped_weeks(
-                    email,
-                    market=mkt["code"],
-                    kept_week=skipped.get("kept_week"),
-                    paused_weeks=skipped.get("paused_weeks"),
-                    subscription_id=skipped.get("subscription_id"),
-                )
-            status = _insert_referral_voucher(result, market=mkt["code"])
-            col = mkt["collections"]["vouchers"]
-            print(f"{tag} {col} insert={status} for {email}", flush=True)
-            return
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            print(
-                f"{tag} attempt {attempt}/{MAX_LOGIN_ATTEMPTS} failed "
-                f"for {email}: {exc}",
-                flush=True,
-            )
-            if attempt < MAX_LOGIN_ATTEMPTS:
-                time.sleep(2.0)
-
-    err_msg = str(last_error) if last_error else "bad_account"
-    mark_bad_account(email, error=err_msg, market=mkt["code"])
     print(
-        f"{tag} badAccount loggedCheck=true after "
-        f"{MAX_LOGIN_ATTEMPTS} failures: {email} ({err_msg})",
+        f"{tag} Processing {email} "
+        f"(attempt {attempt}/{MAX_LOGIN_ATTEMPTS}, "
+        f"lastAttemptEST={doc.get('lastAttemptEST')})",
         flush=True,
     )
+
+    proxy = assign_proxy(market=mkt["code"]) or get_active_proxy()
+    try:
+        result = fetch_referral_for_email(
+            email,
+            proxy=proxy,
+            market=mkt["code"],
+            max_rounds=IMAP_MAX_ROUNDS,
+            poll_seconds=IMAP_POLL_SECONDS,
+        )
+        skipped = result.get("skipped_weeks") or {}
+        paused = skipped.get("paused_weeks") or []
+        if paused:
+            print(
+                f"{tag} Paused {len(paused)} delivery week(s) for {email}",
+                flush=True,
+            )
+        print(
+            f"{tag} Referral {email} → {result['referral_link']}",
+            flush=True,
+        )
+        mark_logged_check(
+            email,
+            referral_link=result["referral_link"],
+            customer_uuid=result.get("customer_uuid"),
+            first_name=result.get("first_name"),
+            invite_link_code=result.get("invite_link_code"),
+            discount_voucher=result.get("discount_voucher"),
+            market=mkt["code"],
+        )
+        if skip_result_ok(skipped):
+            mark_skipped_weeks(
+                email,
+                market=mkt["code"],
+                kept_week=skipped.get("kept_week"),
+                paused_weeks=skipped.get("paused_weeks"),
+                subscription_id=skipped.get("subscription_id"),
+            )
+        status = _insert_referral_voucher(result, market=mkt["code"])
+        col = mkt["collections"]["vouchers"]
+        print(f"{tag} {col} insert={status} for {email}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        err_msg = str(exc)
+        print(
+            f"{tag} attempt {attempt}/{MAX_LOGIN_ATTEMPTS} failed "
+            f"for {email}: {err_msg}",
+            flush=True,
+        )
+        if attempt >= MAX_LOGIN_ATTEMPTS:
+            mark_bad_account(email, error=err_msg, market=mkt["code"])
+            print(
+                f"{tag} badAccount after {MAX_LOGIN_ATTEMPTS} failures "
+                f"(no further retries): {email}",
+                flush=True,
+            )
+        else:
+            release_claim(email, error=err_msg, market=mkt["code"])
+            print(
+                f"{tag} released — retry after ≥15m "
+                f"(attempt {attempt}/{MAX_LOGIN_ATTEMPTS}): {email}",
+                flush=True,
+            )
 
 
 def _worker_loop(
