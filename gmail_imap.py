@@ -563,11 +563,16 @@ def fetch_hellofresh_login_link(
     lookback_minutes: int = 5,
     poll_seconds: int = HELLOFRESH_POLL_SECONDS,
     after_utc: datetime | None = None,
+    exclude_links: set[str] | None = None,
+    exclude_codes: set[str] | None = None,
 ) -> str | None:
     """Poll Gmail IMAP for HelloFresh passwordless LOGIN link (US or CA).
 
     Tries primary then fallback. Skips inboxes on 1h cooldown. Sleeps 90m only
     when every configured inbox is OVERQUOTA.
+
+    ``exclude_links`` / ``exclude_codes`` skip magic links already tried (stale
+    codes bound to a previous passwordless/start guest JWT).
     """
     target = (target_email or "").strip().lower()
     inboxes = _imap_inboxes()
@@ -577,15 +582,19 @@ def fetch_hellofresh_login_link(
             "(set GMAIL_IMAP_PASSWORD / GMAIL_IMAP_FALLBACK_PASSWORD or IMAP_JSON_PATH)"
         )
 
-    filter_time = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
     if after_utc is not None:
         if after_utc.tzinfo is None:
             after_utc = after_utc.replace(tzinfo=timezone.utc)
-        # Keep lookback window — HelloFresh Date is often earlier than submit return.
-        filter_time = max(
-            filter_time,
-            after_utc - timedelta(minutes=lookback_minutes),
+        # Tight skew only. A 5m lookback re-admits older magic links from prior
+        # passwordless/start calls → finish 401 "token does not match".
+        filter_time = after_utc - timedelta(seconds=45)
+    else:
+        filter_time = datetime.now(timezone.utc) - timedelta(
+            minutes=lookback_minutes
         )
+    skip_links = {(_clean_url(u) if u else "") for u in (exclude_links or set())}
+    skip_links.discard("")
+    skip_codes = {c for c in (exclude_codes or set()) if c}
     date_since = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
     sleep_s = max(1, int(poll_seconds))
 
@@ -653,11 +662,23 @@ def fetch_hellofresh_login_link(
                         date_since=date_since,
                     )
                     if link:
+                        cleaned = _clean_url(link)
+                        code_m = re.search(
+                            r"[?&]code=([^&]+)", cleaned, re.IGNORECASE
+                        )
+                        code = unquote(code_m.group(1)) if code_m else ""
+                        if cleaned in skip_links or (code and code in skip_codes):
+                            print(
+                                f"[IMAP] skip stale login link for {target} "
+                                f"(already tried)",
+                                flush=True,
+                            )
+                            continue
                         print(
                             f"[IMAP] Found login link for {target} via {inbox}",
                             flush=True,
                         )
-                        return link
+                        return cleaned
                 except TimeoutError as exc:
                     print(f"[IMAP] stop {inbox}: {exc}", flush=True)
                     private_conns.pop(inbox, None)

@@ -198,14 +198,19 @@ def resolve_magic_link(
     *,
     proxy: dict[str, str] | None = None,
     market: str | None = None,
+    prefer_start_guest: str | None = None,
 ) -> tuple[str, str, str]:
-    """Follow click.link / finish URL → (code, guest_access_token, market)."""
+    """Follow click.link / finish URL → (code, guest_access_token, market).
+
+    When ``prefer_start_guest`` is set (the JWT used for passwordless/start),
+    return that token and only resolve the finish ``code`` — the finish-page
+    SSR guest is a *new* session JWT and will 401 if used instead.
+    """
     mkt_code = (market or detect_market_from_url(login_url) or "US").upper()
     origin = _origin(mkt_code)
     code = extract_finish_code(login_url)
     session = _session(proxy)
     try:
-        # Always load the finish page HTML so we get a fresh guest JWT
         if code and "passwordless/login/finish" in (login_url or ""):
             page_url = login_url
         elif code:
@@ -231,6 +236,9 @@ def resolve_magic_link(
             code = extract_finish_code(resp.text or "")
         if not code:
             raise RuntimeError(f"No finish code in redirect chain ({final[:120]})")
+
+        if prefer_start_guest:
+            return code, prefer_start_guest, mkt_code
 
         guest = extract_guest_token(resp.text or "")
         if not guest:
@@ -449,14 +457,22 @@ def login_and_get_referral(
     start_guest_token: str | None = None,
 ) -> dict[str, Any]:
     """Finish passwordless login and return referral share link + metadata."""
-    code, page_guest, mkt_code = resolve_magic_link(
-        login_url, proxy=proxy, market=market
+    code, finish_guest, mkt_code = resolve_magic_link(
+        login_url,
+        proxy=proxy,
+        market=market,
+        prefer_start_guest=start_guest_token,
     )
-    finish_guest = start_guest_token or page_guest
     if start_guest_token:
-        print("[HF] finish with start_guest", flush=True)
+        print(
+            f"[HF] finish with start_guest (code={code[:12]}…)",
+            flush=True,
+        )
     else:
-        print("[HF] finish with page_guest", flush=True)
+        print(
+            f"[HF] finish with page_guest (code={code[:12]}…)",
+            flush=True,
+        )
     tokens = finish_magic_link(
         code,
         guest_token=finish_guest,
@@ -585,8 +601,10 @@ def fetch_referral_for_email(
         err_l = err.lower()
         if "token does not match" not in err_l and "http 401" not in err_l:
             raise
+        stale_code = extract_finish_code(login_url) or ""
         print(
-            "[HF] magic-link token mismatch — restarting passwordless once",
+            "[HF] magic-link token mismatch — restarting passwordless once "
+            f"(excluding stale code={stale_code[:12]}…)",
             flush=True,
         )
         after = datetime.now(timezone.utc)
@@ -598,6 +616,8 @@ def fetch_referral_for_email(
             after_utc=after,
             max_rounds=max_rounds,
             poll_seconds=poll_seconds,
+            exclude_links={login_url},
+            exclude_codes={stale_code} if stale_code else None,
         )
         if not login_url:
             raise RuntimeError("No HelloFresh login link in Gmail") from exc
