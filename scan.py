@@ -2,7 +2,7 @@
 
 1) Discover HelloFresh share-codes thread(s) (pinned/stickied)
 2) Collect ALL share links + bare promo codes from those threads
-3) Classify each item as US or CA
+3) Classify: .com share → US, .ca share → CA, bare codes → both US and CA
 4) Scan USA with 10 threads (US endpoints + Resi_Lightning)
 5) Scan CAD with 10 threads (CA endpoints + Resi_LightningCA)
 """
@@ -51,11 +51,11 @@ def _landing_url_for_code(code: str, *, market: str = "US") -> str:
 
 
 def detect_item_market(value: str, *, kind: str) -> str:
-    """Classify a share link / bare code as US or CA.
+    """Classify a share link as US or CA.
 
     - hellofresh.ca share/landing URL → CA
-    - hellofresh.com / everything else → US
-    Bare codes default to US (r/hellofresh is primarily US).
+    - hellofresh.com → US
+    Bare codes are handled separately (scanned in both markets).
     """
     text = (value or "").strip().lower()
     if kind == "share" or text.startswith("http"):
@@ -73,13 +73,16 @@ def collect_from_threads(
 
     Each inventory item:
       {kind, value, resolve_url, comment, market}
+
+    Bare promo codes (no share URL) are enqueued for **both** US and CA.
     """
     from monitor import walk_comments
 
     all_comments: list[dict[str, Any]] = []
     inventory: list[dict[str, Any]] = []
     seen_links: set[str] = set()
-    seen_codes: set[str] = set()
+    # (code, market) so the same bare code can be scanned US + CA once each
+    seen_codes: set[tuple[str, str]] = set()
 
     for url in thread_urls:
         print(f"\n📡 Collecting from thread: {url}", flush=True)
@@ -103,19 +106,25 @@ def collect_from_threads(
                 )
             for code in comment.get("promo_codes") or []:
                 code_u = str(code).strip().upper()
-                if not code_u or code_u in seen_codes:
+                if not code_u:
                     continue
-                seen_codes.add(code_u)
-                market = detect_item_market(code_u, kind="code")
-                inventory.append(
-                    {
-                        "kind": "code",
-                        "value": code_u,
-                        "resolve_url": _landing_url_for_code(code_u, market=market),
-                        "comment": comment,
-                        "market": market,
-                    }
-                )
+                # Pure codes → scan USA and CAD (each market's landing URL / proxies)
+                for market in ("US", "CA"):
+                    dedupe = (code_u, market)
+                    if dedupe in seen_codes:
+                        continue
+                    seen_codes.add(dedupe)
+                    inventory.append(
+                        {
+                            "kind": "code",
+                            "value": code_u,
+                            "resolve_url": _landing_url_for_code(
+                                code_u, market=market
+                            ),
+                            "comment": comment,
+                            "market": market,
+                        }
+                    )
 
     us_n = sum(1 for i in inventory if i["market"] == "US")
     ca_n = sum(1 for i in inventory if i["market"] == "CA")
