@@ -89,7 +89,7 @@ def run_menu() -> int:
 
     while True:
         print("\nOptions:")
-        print("  1) Discover share-codes thread(s), collect links/codes, scan (30 workers)")
+        print("  1) Discover share-codes thread(s), collect links/codes, scan (1 worker)")
         print("  2) Monitor only")
         print("  3) Full service (API + referral workers + monitor)")
         print("  q) Quit")

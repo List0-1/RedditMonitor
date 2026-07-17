@@ -18,6 +18,7 @@ import json
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ THREAD_URL = (
     "https://www.reddit.com/r/hellofresh/comments/1uv8bo8/"
     "share_weekly_trial_offer_and_free_box_codes_here/"
 )
+STATUS_WORKERS = 30
 SHARE_RE = re.compile(
     r"https://www\.hellofresh\.(?:com|ca)/gw/share/[A-Za-z0-9][A-Za-z0-9_-]*"
     r"(?:\?[^\s<>\]\)\"'*]*)?",
@@ -243,22 +245,139 @@ def collect_new_hits(
     return hits
 
 
+def _status_check_one(
+    index: int,
+    total: int,
+    doc: dict[str, Any],
+    *,
+    market: str,
+    country: str,
+    locale: str,
+) -> dict[str, int]:
+    """Resolve + update one Mongo voucher. Own session/proxy per worker."""
+    from promo import has_required_api_pricing
+    from vouchers import (
+        comparable_snapshot,
+        is_bad_voucher,
+        promo_result_to_doc,
+        update_voucher,
+    )
+
+    out = {
+        "checked": 1,
+        "updated": 0,
+        "deleted": 0,
+        "ok": 0,
+        "errors": 0,
+        "retries": 0,
+    }
+    tag = f"[{market} {index}/{total}]"
+    code = doc.get("promo_code") or "?"
+    share = doc.get("share_link")
+    print(f"  {tag} {code}", flush=True)
+
+    if not share:
+        print("    → keep (missing share_link — skip resolve)", flush=True)
+        out["ok"] += 1
+        return out
+
+    if is_bad_voucher(doc):
+        print("    → skip resolve (bad in Mongo — kept for scan skip)", flush=True)
+        out["ok"] += 1
+        return out
+
+    promo = resolve_share_link_with_retries(
+        share,
+        market=market,
+        country=country,
+        locale=locale,
+        max_attempts=5,
+    )
+    print(format_promo_result(promo), flush=True)
+
+    voucher = promo.get("voucher") or {}
+    active = voucher.get("is_active")
+    resolved_code = promo.get("promo_code")
+
+    if not has_required_api_pricing(promo):
+        print(
+            f"    → keep (incomplete pricing after retries: {promo.get('error')})",
+            flush=True,
+        )
+        out["errors"] += 1
+        return out
+
+    if active is False:
+        update_voucher(
+            code,
+            {
+                "active": False,
+                "valid": False,
+                "recipes_per_week": 0,
+                "servings_per_recipe": 0,
+            },
+            market=market,
+        )
+        print("    → marked inactive (kept for scan skip)", flush=True)
+        out["updated"] += 1
+        return out
+
+    fresh = promo_result_to_doc(promo, comment=None, market=market)
+    if fresh and is_bad_voucher(fresh):
+        update_fields = {k: fresh[k] for k in comparable_snapshot(fresh) if k in fresh}
+        update_fields.pop("share_link", None)
+        update_fields.pop("share_link_key", None)
+        update_voucher(code, update_fields, market=market)
+        print("    → marked bad (no free meals/servings; kept for scan skip)", flush=True)
+        out["updated"] += 1
+        return out
+
+    if not resolved_code:
+        print(
+            f"    → keep (unresolvable after retries: {promo.get('error')})",
+            flush=True,
+        )
+        out["errors"] += 1
+        return out
+
+    if not fresh:
+        out["errors"] += 1
+        return out
+
+    if fresh.get("active") is None and doc.get("active") is True:
+        print(
+            f"    → keep existing (details unavailable: {promo.get('error')})",
+            flush=True,
+        )
+        out["ok"] += 1
+        return out
+
+    old_snap = comparable_snapshot(doc)
+    new_snap = comparable_snapshot(fresh)
+    if old_snap != new_snap:
+        update_fields = {k: fresh[k] for k in new_snap if k in fresh}
+        update_fields.pop("share_link", None)
+        update_fields.pop("share_link_key", None)
+        update_voucher(code, update_fields, market=market)
+        print("    → updated in Mongo", flush=True)
+        out["updated"] += 1
+    else:
+        print("    → ok (unchanged)", flush=True)
+        out["ok"] += 1
+    return out
+
+
 def refresh_voucher_statuses(
     *,
     market: str = "US",
     country: str | None = None,
     locale: str | None = None,
+    workers: int = STATUS_WORKERS,
 ) -> dict[str, int]:
-    """Re-check every stored voucher for one market; keep bad codes for skip."""
+    """Re-check every stored voucher for one market (parallel workers)."""
     from market import get_market
     from proxies import begin_proxy_cycle, cycle_ips_used, ensure_market_proxies, load_proxies_at_start
-    from vouchers import (
-        comparable_snapshot,
-        is_bad_voucher,
-        list_vouchers,
-        promo_result_to_doc,
-        update_voucher,
-    )
+    from vouchers import list_vouchers
 
     mkt = get_market(market)
     country = country or mkt["country"]
@@ -289,129 +408,44 @@ def refresh_voucher_statuses(
     begin_proxy_cycle(f"status-check-{mkt['code']}")
     ensure_market_proxies(mkt["code"])
     load_proxies_at_start(market=mkt["code"])
+    n_workers = max(1, int(workers))
     print(
         f"\n⏱ Status check [{mkt['code']}]: {len(docs)} voucher(s) "
+        f"workers={n_workers} "
         f"(proxy={mkt['proxy_collection']}, origin={mkt['origin']})",
         flush=True,
     )
-    hf = create_hf_session()
-    try:
-        for i, doc in enumerate(docs, 1):
-            code = doc.get("promo_code") or "?"
-            share = doc.get("share_link")
-            print(f"  [{mkt['code']} {i}/{len(docs)}] {code}", flush=True)
-            stats["checked"] += 1
-            if not share:
-                print("    → keep (missing share_link — skip resolve)", flush=True)
-                stats["ok"] += 1
-                continue
 
-            # Already known-bad: leave in Mongo for scan skip (don't re-burn proxies)
-            if is_bad_voucher(doc):
-                print("    → skip resolve (bad in Mongo — kept for scan skip)", flush=True)
-                stats["ok"] += 1
-                continue
-
-            promo = resolve_share_link_with_retries(
-                share,
-                session=hf,
+    total = len(docs)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [
+            pool.submit(
+                _status_check_one,
+                i,
+                total,
+                doc,
                 market=mkt["code"],
                 country=country,
                 locale=locale,
-                max_attempts=5,
             )
-            print(format_promo_result(promo), flush=True)
-
-            from promo import has_required_api_pricing, is_valid_promo
-
-            voucher = promo.get("voucher") or {}
-            active = voucher.get("is_active")
-            resolved_code = promo.get("promo_code")
-
-            # Incomplete pricing after retries — keep existing Mongo row untouched
-            if not has_required_api_pricing(promo):
-                print(
-                    f"    → keep (incomplete pricing after retries: {promo.get('error')})",
-                    flush=True,
-                )
+            for i, doc in enumerate(docs, 1)
+        ]
+        for fut in as_completed(futures):
+            try:
+                delta = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [{mkt['code']}] status worker error: {exc}", flush=True)
                 stats["errors"] += 1
-                time.sleep(0.5)
+                stats["checked"] += 1
                 continue
-
-            # Keep inactive/bad in Mongo so future scans skip them
-            if active is False:
-                update_voucher(
-                    code,
-                    {
-                        "active": False,
-                        "valid": False,
-                        "recipes_per_week": 0,
-                        "servings_per_recipe": 0,
-                    },
-                    market=mkt["code"],
-                )
-                print("    → marked inactive (kept for scan skip)", flush=True)
-                stats["updated"] += 1
-                time.sleep(0.5)
-                continue
-
-            fresh = promo_result_to_doc(promo, comment=None, market=mkt["code"])
-            if fresh and is_bad_voucher(fresh):
-                update_fields = {k: fresh[k] for k in comparable_snapshot(fresh) if k in fresh}
-                update_fields.pop("share_link", None)
-                update_fields.pop("share_link_key", None)
-                update_voucher(code, update_fields, market=mkt["code"])
-                print("    → marked bad (no free meals/servings; kept for scan skip)", flush=True)
-                stats["updated"] += 1
-                time.sleep(0.5)
-                continue
-
-            # Proxy / transient failure after retries — keep in Mongo
-            if not resolved_code:
-                print(
-                    f"    → keep (unresolvable after retries: {promo.get('error')})",
-                    flush=True,
-                )
-                stats["errors"] += 1
-                time.sleep(0.5)
-                continue
-
-            if not fresh:
-                stats["errors"] += 1
-                time.sleep(0.5)
-                continue
-
-            # If voucher details missing after retries, don't wipe good Mongo data
-            if fresh.get("active") is None and doc.get("active") is True:
-                print(
-                    f"    → keep existing (details unavailable: {promo.get('error')})",
-                    flush=True,
-                )
-                stats["ok"] += 1
-                time.sleep(0.5)
-                continue
-
-            old_snap = comparable_snapshot(doc)
-            new_snap = comparable_snapshot(fresh)
-            if old_snap != new_snap:
-                update_fields = {k: fresh[k] for k in new_snap if k in fresh}
-                # Never rewrite share_link / wipe existing VoucherCodes identity
-                update_fields.pop("share_link", None)
-                update_fields.pop("share_link_key", None)
-                update_voucher(code, update_fields, market=mkt["code"])
-                print("    → updated in Mongo", flush=True)
-                stats["updated"] += 1
-            else:
-                print("    → ok (unchanged)", flush=True)
-                stats["ok"] += 1
-            time.sleep(0.5)
-    finally:
-        hf.close()
+            for k in stats:
+                stats[k] += int(delta.get(k) or 0)
 
     print(
         f"Status done [{mkt['code']}] | checked={stats['checked']} ok={stats['ok']} "
         f"updated={stats['updated']} deleted={stats['deleted']} "
-        f"errors={stats['errors']} | unique_ips={len(cycle_ips_used())}",
+        f"errors={stats['errors']} | unique_ips={len(cycle_ips_used())} "
+        f"| workers={n_workers}",
         flush=True,
     )
 
@@ -465,8 +499,8 @@ def run_monitor_loop(
     target = thread_url or "auto-discover pinned HelloFresh share-codes thread(s)"
     print(
         f"Monitoring {target}\n"
-        f"Reddit scan (US then CA, 30 workers each) every {reddit_interval}s | "
-        f"status check (US+CA) every {status_interval}s\n"
+        f"Reddit scan (US then CA, 1 worker each) every {reddit_interval}s | "
+        f"status check (US+CA, {STATUS_WORKERS} workers) every {status_interval}s\n"
         f"Proxy: {proxy_label(get_active_proxy())}",
         flush=True,
     )

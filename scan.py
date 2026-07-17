@@ -3,8 +3,8 @@
 1) Discover HelloFresh share-codes thread(s) (pinned/stickied)
 2) Collect ALL share links + bare promo codes from those threads
 3) Classify: .com share → US, .ca share → CA, bare codes → both US and CA
-4) Scan USA with 30 threads (US endpoints + Resi_Lightning)
-5) Scan CAD with 30 threads (CA endpoints + Resi_LightningCA)
+4) Scan USA with 1 thread (US endpoints + Resi_Lightning)
+5) Scan CAD with 1 thread (CA endpoints + Resi_LightningCA)
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ THREAD_URL = (
     "https://www.reddit.com/r/hellofresh/comments/1uv8bo8/"
     "share_weekly_trial_offer_and_free_box_codes_here/"
 )
-PROMO_WORKERS = 30
+PROMO_WORKERS = 1
 PROMO_MAX_ATTEMPTS = 5
 MARKET_SCAN_ORDER = ("US", "CA")
 
@@ -440,7 +440,7 @@ def parse_all_links_from_reddit(
     workers: int = PROMO_WORKERS,
     subreddit: str = "hellofresh",
 ) -> dict[str, int]:
-    """Collect from Reddit → classify US/CA → scan US (30) then CA (30)."""
+    """Collect from Reddit → classify US/CA → scan US (1) then CA (1)."""
     del country, locale  # market comes from each item; kept for call-site compat
 
     # --- Phase 1: discover thread(s) + collect all links/codes ---
@@ -482,7 +482,7 @@ def parse_all_links_from_reddit(
         "ca_inserted": 0,
     }
 
-    # --- Phase 2: US then CA, each with its own 10-worker pool ---
+    # --- Phase 2: US then CA (1 worker each; status check uses 30) ---
     for mkt_code in MARKET_SCAN_ORDER:
         items = by_market.get(mkt_code) or []
         delta = _scan_market(items, market=mkt_code, workers=workers)
