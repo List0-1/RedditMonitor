@@ -1,5 +1,4 @@
-# RedditMonitor — always-on worker (512 MB)
-app = "reddit-monitor-cfz"
+app = "hellofresh-monitor"
 primary_region = "iad"
 
 [build]
@@ -7,11 +6,15 @@ primary_region = "iad"
 [env]
   PYTHONUNBUFFERED = "1"
 
-[processes]
-  app = "python -u monitor.py"
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
 
-# Keep the monitor running 24/7 (no scale-to-zero)
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "1024mb"
   cpus = 1

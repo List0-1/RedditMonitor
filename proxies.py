@@ -43,6 +43,7 @@ _active_proxy: dict[str, str] | None = None
 _active_ip: str | None = None
 _cycle_ips: set[str] = set()
 _broken_proxies: set[str] = set()  # identities that failed this process
+_market_rows: dict[str, list[list[str]]] = {}  # US/CA pools (Resi_Lightning / Resi_LightningCA)
 _test_headers = {
     "user-agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14) "
@@ -210,11 +211,42 @@ def pick_working_proxy(
     return None, None
 
 
+def _market_proxy_collection(market: str) -> str:
+    """Market code (US/CA) → Proxies collection name."""
+    try:
+        from market import get_market
+
+        return str(get_market(market)["proxy_collection"])
+    except Exception:  # noqa: BLE001
+        return DEFAULT_PROXY_COLLECTION
+
+
+def ensure_market_proxies(market: str) -> int:
+    """Load the market proxy pool (Resi_Lightning / Resi_LightningCA) once.
+
+    Returns the number of proxies available for that market.
+    """
+    key = (market or "US").upper()
+    with _proxies_lock:
+        cached = _market_rows.get(key)
+    if cached:
+        return len(cached)
+
+    rows = load_proxies_from_db_collection(_market_proxy_collection(key))
+    with _proxies_lock:
+        _market_rows[key] = rows
+    return len(rows)
+
+
 def load_proxies_at_start(
     collection_name: str | None = None,
+    market: str | None = None,
 ) -> dict[str, Any]:
     """Load proxies from MongoDB and select one working pretest-ed proxy."""
     global _proxies_raw, _active_proxy, _active_ip
+
+    if market and not collection_name:
+        collection_name = _market_proxy_collection(market)
 
     collections = list_proxy_collections()
     if not collections:
@@ -330,15 +362,39 @@ def next_proxy(*, prefer_different: bool = True) -> dict[str, str] | None:
     return None
 
 
+def _next_market_proxy(market: str) -> dict[str, str] | None:
+    """Pick + pretest a proxy from the market pool (skips broken ones)."""
+    key = (market or "US").upper()
+    ensure_market_proxies(key)
+    with _proxies_lock:
+        rows = list(_market_rows.get(key) or [])
+        broken = set(_broken_proxies)
+    if not rows:
+        return None
+
+    candidates = [
+        row for row in rows if proxy_identity(to_proxy_dict(*row)) not in broken
+    ]
+    proxy, ip = pick_working_proxy(
+        candidates or rows, max_tries=PROXY_PICK_TRIES, quiet=True
+    )
+    if proxy and ip:
+        with _proxies_lock:
+            _cycle_ips.add(ip)
+        return proxy
+    return None
+
+
 def assign_proxy(
     session: Any | None = None,
     *,
     max_attempts: int = 3,
+    market: str | None = None,
 ) -> dict[str, str] | None:
     """Rotate to a pretest-ed unique-IP proxy; retry up to 3 times if pick fails."""
     proxy = None
     for attempt in range(1, max_attempts + 1):
-        proxy = next_proxy()
+        proxy = _next_market_proxy(market) if market else next_proxy()
         if proxy:
             if session is not None:
                 session._rm_proxies = proxy  # type: ignore[attr-defined]

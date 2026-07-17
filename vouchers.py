@@ -36,11 +36,19 @@ def get_client() -> MongoClient:
     return _client
 
 
-def canonical_share_link(url: str) -> str:
+def _market_host(market: str | None) -> str:
+    return "www.hellofresh.ca" if (market or "US").upper() == "CA" else "www.hellofresh.com"
+
+
+def _market_vouchers_col_name(market: str | None) -> str:
+    return "VoucherCodesCA" if (market or "US").upper() == "CA" else VOUCHERS_COL
+
+
+def canonical_share_link(url: str, *, market: str = "US") -> str:
     """Normalize share / landing URLs for dedupe.
 
-    - /gw/share/CODE  -> https://www.hellofresh.com/gw/share/CODE
-    - ?c=PROMO        -> https://www.hellofresh.com/pages/meal-kit-delivery?c=PROMO
+    - /gw/share/CODE  -> https://{host}/gw/share/CODE
+    - ?c=PROMO        -> https://{host}/pages/meal-kit-delivery?c=PROMO
     """
     from urllib.parse import parse_qs
 
@@ -50,21 +58,27 @@ def canonical_share_link(url: str) -> str:
     parsed = urlparse(raw)
     path = parsed.path.rstrip("/")
     qs = parse_qs(parsed.query)
+    # Keep the link's own market host when it is already a hellofresh domain
+    host = (parsed.hostname or "").lower()
+    if host.endswith("hellofresh.ca"):
+        target_host = "www.hellofresh.ca"
+    elif host.endswith("hellofresh.com"):
+        target_host = "www.hellofresh.com"
+    else:
+        target_host = _market_host(market)
 
     if "/gw/share/" in path.lower():
         code = path.rsplit("/", 1)[-1] if path else ""
         if not code:
             return raw
-        return urlunparse(
-            ("https", "www.hellofresh.com", f"/gw/share/{code}", "", "", "")
-        )
+        return urlunparse(("https", target_host, f"/gw/share/{code}", "", "", ""))
 
     promo = (qs.get("c") or [None])[0]
     if promo:
         return urlunparse(
             (
                 "https",
-                "www.hellofresh.com",
+                target_host,
                 "/pages/meal-kit-delivery",
                 "",
                 f"c={promo}",
@@ -75,16 +89,16 @@ def canonical_share_link(url: str) -> str:
     code = path.rsplit("/", 1)[-1] if path else ""
     if not code:
         return raw
-    return urlunparse(("https", "www.hellofresh.com", f"/gw/share/{code}", "", "", ""))
+    return urlunparse(("https", target_host, f"/gw/share/{code}", "", "", ""))
 
 
-def share_link_key(url: str) -> str:
+def share_link_key(url: str, *, market: str = "US") -> str:
     """Case-insensitive key for dedupe / skip checks."""
-    return canonical_share_link(url).lower()
+    return canonical_share_link(url, market=market).lower()
 
 
-def vouchers_collection() -> Collection:
-    col = get_client()[VOUCHERS_DB][VOUCHERS_COL]
+def vouchers_collection(market: str = "US") -> Collection:
+    col = get_client()[VOUCHERS_DB][_market_vouchers_col_name(market)]
     # Indexes are create-if-missing; never drop the collection or its data.
     col.create_index([("promo_code", ASCENDING)], unique=True, sparse=True)
     col.create_index([("share_link", ASCENDING)], unique=True, sparse=True)
@@ -121,9 +135,10 @@ def servings_per_recipe_of(doc: dict[str, Any] | None) -> float:
 
 
 def is_bad_voucher(doc: dict[str, Any] | None) -> bool:
-    """True for inactive or no usable free-box offer.
+    """True for inactive / invalid or no usable free-box offer.
 
     Bad when:
+      - valid is False, OR
       - active is False, OR
       - recipes_per_week (Your recipes per week) missing/0, OR
       - servings_per_recipe (Servings per recipe) missing/0
@@ -132,13 +147,15 @@ def is_bad_voucher(doc: dict[str, Any] | None) -> bool:
     """
     if not doc:
         return True
+    if doc.get("valid") is False:
+        return True
     if doc.get("active") is False:
         return True
     return recipes_per_week_of(doc) <= 0 or servings_per_recipe_of(doc) <= 0
 
 
-def load_known() -> dict[str, set[str]]:
-    """Preload known share links / promo codes from VoucherCodes.
+def load_known(*, market: str = "US") -> dict[str, set[str]]:
+    """Preload known share links / promo codes from market VoucherCodes*.
 
     Bad vouchers (inactive / zero shipping) stay in Mongo and are listed in
     bad_codes / bad_links so each scan run can skip them without deleting.
@@ -149,7 +166,7 @@ def load_known() -> dict[str, set[str]]:
     bad_codes: set[str] = set()
     bad_links: set[str] = set()
 
-    for doc in vouchers_collection().find(
+    for doc in vouchers_collection(market).find(
         {},
         {
             "share_link": 1,
@@ -157,6 +174,7 @@ def load_known() -> dict[str, set[str]]:
             "promo_code": 1,
             "reddit_comment_id": 1,
             "active": 1,
+            "valid": 1,
             "recipes_per_week": 1,
             "servings_per_recipe": 1,
             "max_free_meals": 1,
@@ -164,11 +182,13 @@ def load_known() -> dict[str, set[str]]:
         },
     ):
         link = doc.get("share_link")
-        key = doc.get("share_link_key") or (share_link_key(link) if link else "")
+        key = doc.get("share_link_key") or (
+            share_link_key(link, market=market) if link else ""
+        )
         if key:
             share_links.add(key)
         if link:
-            share_links.add(share_link_key(link))
+            share_links.add(share_link_key(link, market=market))
         code = str(doc.get("promo_code") or "").strip()
         if code:
             promo_codes.add(code)
@@ -190,13 +210,18 @@ def load_known() -> dict[str, set[str]]:
     }
 
 
-def exists(share_link: str | None = None, promo_code: str | None = None) -> bool:
+def exists(
+    share_link: str | None = None,
+    promo_code: str | None = None,
+    *,
+    market: str = "US",
+) -> bool:
     """True if share_link and/or promo_code already stored (never mutates DB)."""
-    col = vouchers_collection()
+    col = vouchers_collection(market)
     clauses: list[dict[str, Any]] = []
     if share_link:
-        canon = canonical_share_link(share_link)
-        key = share_link_key(share_link)
+        canon = canonical_share_link(share_link, market=market)
+        key = share_link_key(share_link, market=market)
         clauses.append({"share_link": canon})
         clauses.append({"share_link_key": key})
         # Legacy docs without share_link_key
@@ -208,14 +233,15 @@ def exists(share_link: str | None = None, promo_code: str | None = None) -> bool
     return col.find_one({"$or": clauses}, {"_id": 1}) is not None
 
 
-def share_link_exists(share_link: str) -> bool:
-    return exists(share_link=share_link)
+def share_link_exists(share_link: str, *, market: str = "US") -> bool:
+    return exists(share_link=share_link, market=market)
 
 
 def inactive_voucher_doc(
     result: dict[str, Any],
     *,
     comment: dict[str, Any] | None = None,
+    market: str = "US",
 ) -> dict[str, Any] | None:
     """Build a VoucherCodes doc for a confirmed not-working code (active:false)."""
     code = result.get("promo_code")
@@ -234,10 +260,11 @@ def inactive_voucher_doc(
 
     doc: dict[str, Any] = {
         "promo_code": str(code).strip(),
-        "share_link": canonical_share_link(share),
-        "share_link_key": share_link_key(share),
+        "share_link": canonical_share_link(share, market=market),
+        "share_link_key": share_link_key(share, market=market),
         "offer": None,
         "active": False,
+        "valid": False,
         "discount_type": None,
         "discount_value": None,
         "channel": None,
@@ -269,13 +296,14 @@ def promo_result_to_doc(
     result: dict[str, Any],
     *,
     comment: dict[str, Any] | None = None,
+    market: str = "US",
 ) -> dict[str, Any] | None:
     """Build a VoucherCodes document from resolve_share_link() output.
 
     Requires API pricing metrics (recipes_per_week, servings_per_recipe, shipping_at_max).
     Returns None when those are missing — caller must not save incomplete data.
     """
-    from promo import format_offer_line, pricing_metrics_from_result
+    from promo import format_offer_line, is_valid_promo, pricing_metrics_from_result
 
     code = result.get("promo_code")
     share = result.get("share_url")
@@ -288,14 +316,16 @@ def promo_result_to_doc(
 
     voucher = result.get("voucher") or {}
     pricing = result.get("box_pricing") or {}
+    promo_valid = is_valid_promo(result)
 
     now = datetime.now(timezone.utc)
     doc: dict[str, Any] = {
         "promo_code": str(code).strip(),
-        "share_link": canonical_share_link(share),
-        "share_link_key": share_link_key(share),
+        "share_link": canonical_share_link(share, market=market),
+        "share_link_key": share_link_key(share, market=market),
         "offer": format_offer_line(voucher) if voucher else None,
         "active": voucher.get("is_active"),
+        "valid": promo_valid,
         "discount_type": voucher.get("discount_type"),
         "discount_value": voucher.get("discount_value"),
         "channel": voucher.get("channel"),
@@ -329,25 +359,25 @@ def promo_result_to_doc(
     return doc
 
 
-def insert_voucher(doc: dict[str, Any]) -> str:
+def insert_voucher(doc: dict[str, Any], *, market: str = "US") -> str:
     """Insert ONLY if share_link and promo_code are both new.
 
     Never updates, replaces, or deletes existing VoucherCodes documents.
     """
-    col = vouchers_collection()
-    share = canonical_share_link(doc.get("share_link") or "")
+    col = vouchers_collection(market)
+    share = canonical_share_link(doc.get("share_link") or "", market=market)
     code = str(doc.get("promo_code") or "").strip()
     if not share or not code:
         return "skip_invalid"
 
     # Hard skip — do not touch existing rows
-    if exists(share_link=share) or exists(promo_code=code):
+    if exists(share_link=share, market=market) or exists(promo_code=code, market=market):
         return "skip_exists"
 
     now = datetime.now(timezone.utc)
     payload = dict(doc)
     payload["share_link"] = share
-    payload["share_link_key"] = share_link_key(share)
+    payload["share_link_key"] = share_link_key(share, market=market)
     payload["promo_code"] = code
     payload.setdefault("created_at", now)
     payload["updated_at"] = now
@@ -359,11 +389,13 @@ def insert_voucher(doc: dict[str, Any]) -> str:
         return "skip_exists"
 
 
-def list_vouchers() -> list[dict[str, Any]]:
-    return list(vouchers_collection().find({}))
+def list_vouchers(*, market: str = "US") -> list[dict[str, Any]]:
+    return list(vouchers_collection(market).find({}))
 
 
-def update_voucher(promo_code: str, fields: dict[str, Any]) -> None:
+def update_voucher(
+    promo_code: str, fields: dict[str, Any], *, market: str = "US"
+) -> None:
     """Partial update only — never writes nulls over existing values, never changes share_link."""
     clean = {
         k: v
@@ -373,7 +405,7 @@ def update_voucher(promo_code: str, fields: dict[str, Any]) -> None:
     if not clean:
         return
     clean["updated_at"] = datetime.now(timezone.utc)
-    vouchers_collection().update_one(
+    vouchers_collection(market).update_one(
         {"promo_code": promo_code},
         {"$set": clean},
     )
@@ -389,6 +421,7 @@ def comparable_snapshot(doc: dict[str, Any]) -> dict[str, Any]:
     return {
         "offer": doc.get("offer"),
         "active": doc.get("active"),
+        "valid": doc.get("valid"),
         "discount_type": doc.get("discount_type"),
         "discount_value": doc.get("discount_value"),
         "channel": doc.get("channel"),
@@ -402,8 +435,9 @@ def comparable_snapshot(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def best_voucher_collection() -> Collection:
-    return get_client()[VOUCHERS_DB][BEST_COL]
+def best_voucher_collection(*, market: str = "US") -> Collection:
+    name = "BestVoucherCodeCA" if (market or "US").upper() == "CA" else BEST_COL
+    return get_client()[VOUCHERS_DB][name]
 
 
 def voucher_rank_key(doc: dict[str, Any]) -> tuple[float, float, float]:
@@ -421,7 +455,9 @@ def voucher_rank_key(doc: dict[str, Any]) -> tuple[float, float, float]:
 
 
 def _eligible_for_best(doc: dict[str, Any]) -> bool:
-    """Active with real free-box metrics (recipes>0 and servings>0)."""
+    """Valid + active with real free-box metrics (recipes>0 and servings>0)."""
+    if doc.get("valid") is False:
+        return False
     if doc.get("active") is not True:
         return False
     return recipes_per_week_of(doc) > 0 and servings_per_recipe_of(doc) > 0
@@ -429,9 +465,11 @@ def _eligible_for_best(doc: dict[str, Any]) -> bool:
 
 def select_best_active_voucher(
     docs: list[dict[str, Any]] | None = None,
+    *,
+    market: str = "US",
 ) -> dict[str, Any] | None:
     """Pick best eligible voucher, or None → BestVoucherCode should be empty."""
-    pool = docs if docs is not None else list_vouchers()
+    pool = docs if docs is not None else list_vouchers(market=market)
     eligible = [d for d in pool if _eligible_for_best(d)]
     if not eligible:
         return None
@@ -452,12 +490,16 @@ def _check_time_fields(now: datetime | None = None) -> dict[str, Any]:
 
 def update_best_voucher_code(
     docs: list[dict[str, Any]] | None = None,
+    *,
+    market: str = "US",
 ) -> dict[str, Any] | None:
-    """Select best voucher and upsert HelloFresh.BestVoucherCode (or clear it)."""
-    best = select_best_active_voucher(docs)
-    col = best_voucher_collection()
+    """Select best voucher and upsert HelloFresh.BestVoucherCode* (or clear it)."""
+    mkt = (market or "US").upper()
+    best = select_best_active_voucher(docs, market=mkt)
+    col = best_voucher_collection(market=mkt)
     now = datetime.now(timezone.utc)
     check_times = _check_time_fields(now)
+    label = "BestVoucherCodeCA" if mkt == "CA" else "BestVoucherCode"
 
     if best is None:
         col.replace_one(
@@ -466,7 +508,7 @@ def update_best_voucher_code(
             upsert=True,
         )
         print(
-            "BestVoucherCode: empty (no active code with recipes_per_week>0 "
+            f"{label}: empty (no active code with recipes_per_week>0 "
             f"and servings_per_recipe>0) | {check_times['CheckTimeEST']}",
             flush=True,
         )
@@ -478,13 +520,14 @@ def update_best_voucher_code(
     payload["servings_per_recipe"] = int(servings_per_recipe_of(best))
     payload.pop("max_free_meals", None)
     payload.pop("servings_at_max", None)
+    payload["market"] = mkt
     payload["selected_at"] = now
     payload["updated_at"] = now
     payload.update(check_times)
     col.replace_one({"_id": BEST_DOC_ID}, {"_id": BEST_DOC_ID, **payload}, upsert=True)
 
     print(
-        f"BestVoucherCode → {payload.get('promo_code')} | "
+        f"{label} → {payload.get('promo_code')} | "
         f"shipping_at_max={payload.get('shipping_at_max')} "
         f"recipes_per_week={payload.get('recipes_per_week')} "
         f"servings_per_recipe={payload.get('servings_per_recipe')} | "

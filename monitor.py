@@ -36,9 +36,8 @@ THREAD_URL = (
     "https://www.reddit.com/r/hellofresh/comments/1uv8bo8/"
     "share_weekly_trial_offer_and_free_box_codes_here/"
 )
-SHARE_PREFIX = "https://www.hellofresh.com/gw/share"
 SHARE_RE = re.compile(
-    r"https://www\.hellofresh\.com/gw/share/[A-Za-z0-9][A-Za-z0-9_-]*"
+    r"https://www\.hellofresh\.(?:com|ca)/gw/share/[A-Za-z0-9][A-Za-z0-9_-]*"
     r"(?:\?[^\s<>\]\)\"'*]*)?",
     re.IGNORECASE,
 )
@@ -58,7 +57,10 @@ def normalize_share_url(url: str) -> str | None:
         .rstrip(".,;:!?*_~`\"')>]} ")
     )
     url = re.split(r"</", url, maxsplit=1)[0]
-    if not url.lower().startswith(SHARE_PREFIX + "/"):
+    lower = url.lower()
+    if "/gw/share/" not in lower or "hellofresh." not in lower:
+        return None
+    if "hellofresh.com" not in lower and "hellofresh.ca" not in lower:
         return None
 
     parsed = urlparse(url)
@@ -66,8 +68,14 @@ def normalize_share_url(url: str) -> str | None:
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,}", code):
         return None
 
+    host = (parsed.netloc or "").lower()
+    if host.endswith("hellofresh.ca"):
+        netloc = "www.hellofresh.ca"
+    else:
+        netloc = "www.hellofresh.com"
+
     return urlunparse(
-        (parsed.scheme, parsed.netloc, parsed.path, "", parsed.query, "")
+        ("https", netloc, parsed.path, "", parsed.query, "")
     )
 
 
@@ -237,11 +245,13 @@ def collect_new_hits(
 
 def refresh_voucher_statuses(
     *,
-    country: str = "US",
-    locale: str = "en-US",
+    market: str = "US",
+    country: str | None = None,
+    locale: str | None = None,
 ) -> dict[str, int]:
-    """Re-check every stored voucher; update changes; keep bad codes for skip."""
-    from proxies import begin_proxy_cycle, cycle_ips_used
+    """Re-check every stored voucher for one market; keep bad codes for skip."""
+    from market import get_market
+    from proxies import begin_proxy_cycle, cycle_ips_used, ensure_market_proxies, load_proxies_at_start
     from vouchers import (
         comparable_snapshot,
         is_bad_voucher,
@@ -250,7 +260,10 @@ def refresh_voucher_statuses(
         update_voucher,
     )
 
-    docs = list_vouchers()
+    mkt = get_market(market)
+    country = country or mkt["country"]
+    locale = locale or mkt["locale"]
+    docs = list_vouchers(market=mkt["code"])
     stats = {
         "checked": 0,
         "updated": 0,
@@ -260,19 +273,25 @@ def refresh_voucher_statuses(
         "retries": 0,
     }
     if not docs:
-        print("Status check: no vouchers in Mongo.", flush=True)
+        print(f"Status check [{mkt['code']}]: no vouchers in Mongo.", flush=True)
         from vouchers import update_best_voucher_code
 
         try:
-            update_best_voucher_code([])
+            update_best_voucher_code([], market=mkt["code"])
         except Exception as exc:  # noqa: BLE001
-            print(f"BestVoucherCode update error: {exc}", file=sys.stderr, flush=True)
+            print(
+                f"BestVoucherCode[{mkt['code']}] update error: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
         return stats
 
-    begin_proxy_cycle("status-check")
+    begin_proxy_cycle(f"status-check-{mkt['code']}")
+    ensure_market_proxies(mkt["code"])
+    load_proxies_at_start(market=mkt["code"])
     print(
-        f"\n⏱ Status check: {len(docs)} voucher(s) "
-        f"(pretested unique-IP proxies, 3 retries)",
+        f"\n⏱ Status check [{mkt['code']}]: {len(docs)} voucher(s) "
+        f"(proxy={mkt['proxy_collection']}, origin={mkt['origin']})",
         flush=True,
     )
     hf = create_hf_session()
@@ -280,7 +299,7 @@ def refresh_voucher_statuses(
         for i, doc in enumerate(docs, 1):
             code = doc.get("promo_code") or "?"
             share = doc.get("share_link")
-            print(f"  [{i}/{len(docs)}] {code}", flush=True)
+            print(f"  [{mkt['code']} {i}/{len(docs)}] {code}", flush=True)
             stats["checked"] += 1
             if not share:
                 print("    → keep (missing share_link — skip resolve)", flush=True)
@@ -296,13 +315,14 @@ def refresh_voucher_statuses(
             promo = resolve_share_link_with_retries(
                 share,
                 session=hf,
+                market=mkt["code"],
                 country=country,
                 locale=locale,
                 max_attempts=5,
             )
             print(format_promo_result(promo), flush=True)
 
-            from promo import has_required_api_pricing
+            from promo import has_required_api_pricing, is_valid_promo
 
             voucher = promo.get("voucher") or {}
             active = voucher.get("is_active")
@@ -324,21 +344,23 @@ def refresh_voucher_statuses(
                     code,
                     {
                         "active": False,
+                        "valid": False,
                         "recipes_per_week": 0,
                         "servings_per_recipe": 0,
                     },
+                    market=mkt["code"],
                 )
                 print("    → marked inactive (kept for scan skip)", flush=True)
                 stats["updated"] += 1
                 time.sleep(0.5)
                 continue
 
-            fresh = promo_result_to_doc(promo, comment=None)
+            fresh = promo_result_to_doc(promo, comment=None, market=mkt["code"])
             if fresh and is_bad_voucher(fresh):
                 update_fields = {k: fresh[k] for k in comparable_snapshot(fresh) if k in fresh}
                 update_fields.pop("share_link", None)
                 update_fields.pop("share_link_key", None)
-                update_voucher(code, update_fields)
+                update_voucher(code, update_fields, market=mkt["code"])
                 print("    → marked bad (no free meals/servings; kept for scan skip)", flush=True)
                 stats["updated"] += 1
                 time.sleep(0.5)
@@ -376,7 +398,7 @@ def refresh_voucher_statuses(
                 # Never rewrite share_link / wipe existing VoucherCodes identity
                 update_fields.pop("share_link", None)
                 update_fields.pop("share_link_key", None)
-                update_voucher(code, update_fields)
+                update_voucher(code, update_fields, market=mkt["code"])
                 print("    → updated in Mongo", flush=True)
                 stats["updated"] += 1
             else:
@@ -387,7 +409,7 @@ def refresh_voucher_statuses(
         hf.close()
 
     print(
-        f"Status done | checked={stats['checked']} ok={stats['ok']} "
+        f"Status done [{mkt['code']}] | checked={stats['checked']} ok={stats['ok']} "
         f"updated={stats['updated']} deleted={stats['deleted']} "
         f"errors={stats['errors']} | unique_ips={len(cycle_ips_used())}",
         flush=True,
@@ -396,11 +418,36 @@ def refresh_voucher_statuses(
     from vouchers import update_best_voucher_code
 
     try:
-        update_best_voucher_code()
+        update_best_voucher_code(market=mkt["code"])
     except Exception as exc:  # noqa: BLE001
-        print(f"BestVoucherCode update error: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"BestVoucherCode[{mkt['code']}] update error: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     return stats
+
+
+def refresh_all_voucher_statuses() -> dict[str, int]:
+    """Status-check US then CA voucher collections."""
+    totals = {
+        "checked": 0,
+        "updated": 0,
+        "deleted": 0,
+        "ok": 0,
+        "errors": 0,
+        "retries": 0,
+    }
+    for market in ("US", "CA"):
+        try:
+            delta = refresh_voucher_statuses(market=market)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Status check [{market}] error: {exc}", file=sys.stderr, flush=True)
+            continue
+        for k in totals:
+            totals[k] += int(delta.get(k) or 0)
+    return totals
 
 
 def run_monitor_loop(
@@ -411,14 +458,15 @@ def run_monitor_loop(
     country: str = "US",
     locale: str = "en-US",
 ) -> None:
-    """Monitor: discover share-codes thread(s), scan every 30m; status every 5m."""
+    """Monitor: Reddit US+CA scan every 30m; US+CA status every 5m."""
     from scan import parse_all_links_from_reddit
 
+    del country, locale  # markets handled inside scan/status
     target = thread_url or "auto-discover pinned HelloFresh share-codes thread(s)"
     print(
         f"Monitoring {target}\n"
-        f"Reddit scan every {reddit_interval}s | "
-        f"status check every {status_interval}s\n"
+        f"Reddit scan (US then CA, 10 workers each) every {reddit_interval}s | "
+        f"status check (US+CA) every {status_interval}s\n"
         f"Proxy: {proxy_label(get_active_proxy())}",
         flush=True,
     )
@@ -434,16 +482,14 @@ def run_monitor_loop(
                     flush=True,
                 )
                 try:
-                    parse_all_links_from_reddit(
-                        thread_url, country=country, locale=locale
-                    )
+                    parse_all_links_from_reddit(thread_url)
                 except Exception as exc:  # noqa: BLE001
                     print(f"Reddit scan error: {exc}", file=sys.stderr, flush=True)
                 next_reddit = time.time() + max(reddit_interval, 60)
 
             if now >= next_status:
                 try:
-                    refresh_voucher_statuses(country=country, locale=locale)
+                    refresh_all_voucher_statuses()
                 except Exception as exc:  # noqa: BLE001
                     print(f"Status check error: {exc}", file=sys.stderr, flush=True)
                 next_status = time.time() + max(status_interval, 30)

@@ -1,14 +1,18 @@
 """Resolve HelloFresh share links to promo codes via HAR-captured flow.
 
-Flow (from hffindpromocode.har + boxprice.har):
-1. GET share URL  -> redirects to landing page with ?c=PROMO_CODE
+Flow (TestPromo.har + hffindpromocode.har + boxprice.har):
+1. GET /gw/share/{slug} -> redirect to landing/plans with ?c=PROMO_CODE
 2. Read guest JWT from __NEXT_DATA__.props.pageProps.ssrPayload.serverAuth.access_token
-3. GET /gw/vouchers/{code}?country=US&locale=en-US  (optional details)
-4. GET /gw/calculate/prospect/batch?voucherCode=...&productIds=US-CBU-...
-   -> per-SKU box price after discount; find max meals/week still at $0
+3. GET /gw/vouchers/{code}?country=&locale=  (is_active, discount_settings)
+4. POST /gw/voucher/validate  (checkout UI; guest customer_id=0)
+   - error_code 1026 (customer_attachment_limit) is a hard fail — treat as
+     dead/invalid for scan save (active:false, valid:false).
+5. GET /gw/calculate/prospect/batch?voucherCode=&productIds=&zipCode=
+   -> per-SKU pricing; find max recipes/week at implied box $0 (2 servings)
+6. (UI only) GET /gw/price-presentation/v2/discount_communication/voucher/{code}
 
-The promo code itself comes from step 1 (redirect ?c=). Steps 3–4 may fail
-under rate limits — that is not fatal if promo_code is already known.
+Scan "valid promo" = is_active is not False + zip + free-box pricing metrics
+(recipes_per_week, servings_per_recipe, shipping_at_max). See is_valid_promo().
 """
 
 from __future__ import annotations
@@ -148,11 +152,16 @@ def _proxies_of(session: crequests.Session) -> dict[str, str] | None:
     return getattr(session, "_rm_proxies", None)
 
 
-def _fresh_proxies(session: crequests.Session) -> dict[str, str] | None:
+def _fresh_proxies(
+    session: crequests.Session,
+    *,
+    market: str | None = None,
+) -> dict[str, str] | None:
     """Rotate to a new proxy for this HTTP call and attach it to the session."""
     from proxies import assign_proxy
 
-    return assign_proxy(session)
+    mkt = market or getattr(session, "_rm_market", None)
+    return assign_proxy(session, market=mkt)
 
 
 def check_voucher(
@@ -162,10 +171,11 @@ def check_voucher(
     referer: str,
     country: str = "US",
     locale: str = "en-US",
+    origin: str = "https://www.hellofresh.com",
 ) -> dict[str, Any]:
     """HAR check-promo request: GET /gw/vouchers/{code}."""
     resp = session.get(
-        f"https://www.hellofresh.com/gw/vouchers/{code}",
+        f"{origin}/gw/vouchers/{code}",
         params={"country": country, "locale": locale},
         proxies=_fresh_proxies(session),
         headers=_browser_headers(
@@ -185,6 +195,109 @@ def check_voucher(
     return resp.json()
 
 
+def validate_voucher(
+    session: crequests.Session,
+    code: str,
+    access_token: str,
+    referer: str,
+    *,
+    country: str = "US",
+    locale: str = "en-US",
+    product_ids: list[str] | None = None,
+    origin: str = "https://www.hellofresh.com",
+    customer_id: int = 0,
+    subscription_id: int = 0,
+) -> dict[str, Any]:
+    """HAR checkout validate: POST /gw/voucher/validate.
+
+    TestPromo.har uses guest ids (0). error_code 1026 (customer_attachment_limit)
+    means the voucher is not usable for this scan — treated as validate hard-fail.
+    """
+    body = {
+        "code": code,
+        "country": country,
+        "locale": locale,
+        "systemCountry": country,
+        "products": list(product_ids or DEFAULT_PRODUCT_IDS),
+        "customer_id": customer_id,
+        "subscription_id": subscription_id,
+    }
+    resp = session.post(
+        f"{origin}/gw/voucher/validate",
+        json=body,
+        proxies=_fresh_proxies(session),
+        headers=_browser_headers(
+            Accept="application/json, text/plain, */*",
+            Authorization=f"Bearer {access_token}",
+            Referer=referer,
+            Origin=origin,
+            **{
+                "Content-Type": "application/json",
+                "x-requested-by": "client-platform",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+            },
+        ),
+        timeout=15,
+    )
+    try:
+        payload = resp.json()
+    except Exception:  # noqa: BLE001
+        payload = {"status": "error", "raw": (resp.text or "")[:500]}
+    payload["_http_status"] = resp.status_code
+    return payload
+
+
+def summarize_voucher_validate(payload: dict[str, Any]) -> dict[str, Any]:
+    """Compact validate response for logs / Mongo."""
+    return {
+        "http_status": payload.get("_http_status"),
+        "status": payload.get("status"),
+        "error_type": payload.get("error_type"),
+        "error_code": payload.get("error_code"),
+        "msg": payload.get("msg"),
+    }
+
+
+def is_soft_validate_error(payload: dict[str, Any] | None) -> bool:
+    """True when validate failed for ignorable session reasons, not bad code.
+
+    Note: 1026 / customer_attachment_limit is NOT soft — see is_validate_hard_fail.
+    """
+    if not payload:
+        return False
+    return False
+
+
+def is_validate_hard_fail(payload: dict[str, Any] | None) -> bool:
+    """True when validate says the voucher code itself is not usable."""
+    if not payload:
+        return False
+    if payload.get("status") in {"success", "ok"}:
+        return False
+    if is_soft_validate_error(payload):
+        return False
+    err_type = str(payload.get("error_type") or "")
+    code = str(payload.get("error_code") or "")
+    # Unknown / generic validation noise — do not treat as dead code
+    if err_type == "VOUCHER_VALIDATION_ERROR" and not code:
+        return False
+    # Explicit dead / unusable codes (guest validate + attachment limit)
+    if code in {"1001", "1002", "1003", "1010", "1026"}:
+        return True
+    msg = str(payload.get("msg") or "").lower()
+    if (
+        "customer_attachment_limit" in msg
+        or "attachment_limit" in msg
+        or "not found" in msg
+        or "invalid voucher" in msg
+        or "does not exist" in msg
+    ):
+        return True
+    return False
+
+
 def calculate_prospect_batch(
     session: crequests.Session,
     code: str,
@@ -196,6 +309,7 @@ def calculate_prospect_batch(
     zip_code: str | None = None,
     *,
     zip_attempts: int = 3,
+    origin: str = "https://www.hellofresh.com",
 ) -> tuple[dict[str, Any], str]:
     """HAR boxprice batch. Returns (payload, zip_used).
 
@@ -208,7 +322,9 @@ def calculate_prospect_batch(
     proxies = _fresh_proxies(session)
     exit_ip = get_active_ip()
     forced_zip = str(zip_code).strip() if zip_code else ""
-    resolved_zip = forced_zip or (zipcode_for_exit_ip(exit_ip) or FALLBACK_ZIP)
+    # CA uses a Canadian postal fallback when geo lookup fails
+    fallback = "H3X3S1" if str(country).upper() in {"CA", "CAD"} else FALLBACK_ZIP
+    resolved_zip = forced_zip or (zipcode_for_exit_ip(exit_ip) or fallback)
 
     params: dict[str, str] = {
         "hfCountryCode": country,
@@ -219,7 +335,7 @@ def calculate_prospect_batch(
     }
 
     resp = session.get(
-        "https://www.hellofresh.com/gw/calculate/prospect/batch",
+        f"{origin}/gw/calculate/prospect/batch",
         params=params,
         proxies=proxies,
         headers=_browser_headers(
@@ -349,12 +465,26 @@ def resolve_share_link(
     check_details: bool = True,
     check_box_prices: bool = True,
     proxies: dict[str, str] | None = None,
+    market: str | None = None,
 ) -> dict[str, Any]:
     """Open share link, extract promo code, voucher details, and free-box max meals."""
+    origin = "https://www.hellofresh.com"
+    product_ids: list[str] | None = None
+    if market:
+        from market import get_market
+
+        mkt = get_market(market)
+        country = mkt["country"]
+        locale = mkt["locale"]
+        origin = mkt["origin"]
+        product_ids = list(mkt["product_ids"])
+
     own_session = session is None
     session = session or create_hf_session(proxies=proxies)
     if proxies is not None:
         session._rm_proxies = proxies  # type: ignore[attr-defined]
+    if market:
+        session._rm_market = str(market).upper()  # type: ignore[attr-defined]
     result: dict[str, Any] = {
         "share_url": share_url,
         "promo_code": None,
@@ -367,13 +497,14 @@ def resolve_share_link(
         "transient": False,
         "permanent": False,
         "code_invalid": False,
+        "voucher_validate": None,
     }
     notes: list[str] = []
 
     try:
         page = session.get(
             share_url,
-            proxies=_fresh_proxies(session),
+            proxies=_fresh_proxies(session, market=market),
             headers=_browser_headers(Accept="text/html,application/xhtml+xml,*/*"),
             allow_redirects=True,
             timeout=10,
@@ -427,8 +558,27 @@ def resolve_share_link(
                     referer=page.url,
                     country=country,
                     locale=locale,
+                    origin=origin,
                 )
                 result["voucher"] = summarize_voucher(voucher)
+                try:
+                    validate_payload = validate_voucher(
+                        session,
+                        code=code,
+                        access_token=token,
+                        referer=page.url,
+                        country=country,
+                        locale=locale,
+                        product_ids=product_ids,
+                        origin=origin,
+                    )
+                    result["voucher_validate"] = summarize_voucher_validate(
+                        validate_payload
+                    )
+                    if is_validate_hard_fail(validate_payload):
+                        result["code_invalid"] = True
+                except Exception as exc:  # noqa: BLE001
+                    notes.append(f"voucher validate unavailable: {exc}")
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"voucher details unavailable: {exc}")
                 if _is_permanent_voucher_miss(exc):
@@ -445,6 +595,8 @@ def resolve_share_link(
                     access_token=token,
                     referer=page.url,
                     country=country,
+                    product_ids=product_ids,
+                    origin=origin,
                 )
                 result["zip_code"] = zip_used
                 result["exit_ip"] = get_active_ip()
@@ -528,6 +680,7 @@ def is_confirmed_dead_code(result: dict[str, Any]) -> bool:
 
     Observed for dead codes:
       - GET /gw/vouchers/{code} → HTTP 404, voucher=null
+      - POST /gw/voucher/validate hard-fail (includes 1026 attachment limit)
       - box pricing may still return with recipes_per_week=None / best_free=None
       - OR voucher.is_active is False
     """
@@ -537,6 +690,9 @@ def is_confirmed_dead_code(result: dict[str, Any]) -> bool:
     if voucher.get("is_active") is False:
         return True
     if result.get("code_invalid"):
+        return True
+    validate = result.get("voucher_validate")
+    if isinstance(validate, dict) and is_validate_hard_fail(validate):
         return True
     if _is_permanent_voucher_miss(result.get("error")):
         return True
@@ -549,6 +705,31 @@ def has_required_api_pricing(result: dict[str, Any]) -> bool:
     if not zip_code:
         return False
     return pricing_metrics_from_result(result) is not None
+
+
+def is_valid_promo(result: dict[str, Any]) -> bool:
+    """HAR-aligned "good promo" for voucher scan / BestVoucherCode.
+
+    Requires:
+      - not a confirmed dead code (404 / inactive / validate hard-fail)
+      - voucher.is_active is not False when voucher details were returned
+      - zip_code + recipes_per_week / servings_per_recipe / shipping_at_max
+      - recipes_per_week > 0 and servings_per_recipe > 0 (free-box offer)
+    """
+    if not result.get("promo_code"):
+        return False
+    if is_confirmed_dead_code(result):
+        return False
+    voucher = result.get("voucher") or {}
+    if voucher and voucher.get("is_active") is False:
+        return False
+    if not has_required_api_pricing(result):
+        return False
+    metrics = pricing_metrics_from_result(result)
+    if not metrics:
+        return False
+    return metrics["recipes_per_week"] > 0 and metrics["servings_per_recipe"] > 0
+
 
 
 def _summarize_batch_response(batch: dict[str, Any]) -> dict[str, Any]:
@@ -668,6 +849,7 @@ def resolve_share_link_with_retries(
     country: str = "US",
     locale: str = "en-US",
     max_attempts: int = 5,
+    market: str | None = None,
 ) -> dict[str, Any]:
     """Resolve share link; require pricing metrics; swap proxy and retry up to 5x."""
     import time
@@ -685,6 +867,7 @@ def resolve_share_link_with_retries(
                     session=session,
                     country=country,
                     locale=locale,
+                    market=market,
                 )
             except Exception as exc:  # noqa: BLE001
                 promo = {
@@ -730,9 +913,10 @@ def resolve_share_link_with_retries(
                 promo["incomplete"] = True
                 return promo
 
-            # Success: promo code + zip + the 3 required API pricing fields
-            if code and complete:
+            # Success: HAR valid-promo criteria (active + free-box metrics + zip)
+            if code and is_valid_promo(promo):
                 promo["incomplete"] = False
+                promo["valid"] = True
                 return promo
 
             details = incomplete_pricing_details(promo)
